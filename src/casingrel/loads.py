@@ -152,9 +152,7 @@ def resolve_strings(well: WellInput, survey: Survey, profiles: Profiles,
             r["mud_ppg"] = _base(s.mud_ppg)
         else:
             z = np.linspace(r["outer_shoe_tvd_ft"] or 0.0, r["shoe_tvd_ft"], 200)
-            # Round to 0.01 first so float noise (10.2003) does not round up a whole 0.1 ppg.
-            need = round(float(profiles.pore_ppg(z).max()) + well.margins.trip_margin_ppg, 2)
-            mud = math.ceil(need * 10 - 1e-9) / 10
+            mud = float(required_mud_ppg(profiles.pore_ppg(z).max(), well.margins.trip_margin_ppg))
             r["mud_ppg"] = mud
             notes.append(f"{s.name}: mud_ppg not given; used {mud:.1f} ppg "
                          f"(max pore pressure in the section + trip margin, placeholder)")
@@ -163,6 +161,15 @@ def resolve_strings(well: WellInput, survey: Survey, profiles: Profiles,
         r["next_td_tvd_ft"] = deeper[0]["shoe_tvd_ft"] if deeper else None
         r["next_mud_ppg"] = deeper[0]["mud_ppg"] if deeper else None
     return [StringGeometry(**r) for r in resolved], notes
+
+
+def required_mud_ppg(max_pore_ppg: ArrayLike, trip_margin_ppg: float) -> np.ndarray:
+    """Mud weight for a hole section: highest pore pressure + trip margin, rounded up to 0.1 ppg.
+
+    Rounds to 0.01 first so float noise (10.2003) does not round up a whole 0.1 ppg.
+    """
+    need = np.round(np.asarray(max_pore_ppg, dtype=float) + trip_margin_ppg, 2)
+    return np.ceil(need * 10 - 1e-9) / 10
 
 
 def _resolve_shoe(s: CasingString, survey: Survey, chosen: dict[str, float]) -> tuple[float, float]:

@@ -267,7 +267,7 @@ def test_choose_needs_a_depth():
 
 @pytest.mark.parametrize("fname,chosen", [
     ("synthetic_a_shallow_vertical.yaml", {}),
-    ("synthetic_b_deep_overpressured.yaml", {"intermediate_1": 10_290.0, "intermediate_2": 14_070.0}),
+    ("synthetic_b_deep_overpressured.yaml", {"intermediate_1": 11_370.0, "intermediate_2": 14_490.0}),
     ("synthetic_c_horizontal_frac.yaml", {}),
 ])
 def test_bundled_wells_run(fname, chosen):
