@@ -59,6 +59,7 @@ class SyntheticWellParams:
     pore_shift_sd_ppg: float = 0.3
     fluids: dict[str, Any] = field(default_factory=dict)
     load_cases: dict[str, Any] = field(default_factory=dict)
+    reference_designs: list[dict[str, Any]] = field(default_factory=list)
     seed: int = 0
 
 
@@ -101,10 +102,12 @@ def make_input(p: SyntheticWellParams) -> dict[str, Any]:
         data["fluids"] = dict(p.fluids)
     if p.load_cases:
         data["load_cases"] = {k: dict(v) for k, v in p.load_cases.items()}
+    if p.reference_designs:
+        data["reference_designs"] = _plain(p.reference_designs)
     data["sources"] = {"all": SYNTHETIC_NOTE}
     # Record the generator parameters that are not already visible in the file.
     params = {k: v for k, v in dataclasses.asdict(p).items()
-              if k not in ("name", "strings", "fluids", "load_cases", "seed")}
+              if k not in ("name", "strings", "fluids", "load_cases", "reference_designs", "seed")}
     data["meta"] = {"synthetic": True, "generator": GENERATOR, "seed": p.seed,
                     "params": _plain(params), "note": SYNTHETIC_NOTE}
     WellInput.model_validate(data)  # fail here, not in a later stage
@@ -231,6 +234,16 @@ def bundled_wells() -> dict[str, SyntheticWellParams]:
             "liner": {"frac_down_casing": {"max_surface_psi": 9_500, "fluid_ppg": 8.4},
                       "evacuation": "full", "depletion": {"pore_ppg": 6.0}, "cementing": True},
         },
+        # Pipes and walls from the spec's Section 6.1 table; no connection data or drift.
+        reference_designs=[{
+            "name": "illustrative design (spec 6.1 pipes)",
+            "source": "SYNTHETIC: pipe sizes picked to exercise the checks, not an engineered design",
+            "strings": {
+                "surface": [{"grade": "L80", "weight_lb_per_ft": 40.0, "wall_in": 0.395}],
+                "intermediate": [{"grade": "P110", "weight_lb_per_ft": 26.0, "wall_in": 0.362}],
+                "liner": [{"grade": "P110", "weight_lb_per_ft": 11.6, "wall_in": 0.250}],
+            },
+        }],
         seed=3)
 
     return {"synthetic_a_shallow_vertical.yaml": shallow,

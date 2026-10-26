@@ -544,10 +544,20 @@ class Well(_Model):
 
 
 class ReferenceSection(_Model):
+    """One pipe section of a reference design. Give wall_in (from the data
+    sheet) for the design to be checked; od_in defaults to the string's OD and
+    yield_psi to the API 5CT minimum for the grade."""
+
     grade: str
     weight_lb_per_ft: float
     od_in: In | None = None
+    wall_in: In | None = None
+    yield_psi: Annotated[float, _q("psi")] | None = None
+    drift_in: In | None = None
     connection: str | None = None
+    conn_tension_lbf: Annotated[float, _q("lbf")] | None = None
+    conn_compression_lbf: Annotated[float, _q("lbf")] | None = None
+    conn_internal_psi: Annotated[float, _q("psi")] | None = None
     top_md_ft: Ft | None = None
     bottom_md_ft: Ft | None = None
 

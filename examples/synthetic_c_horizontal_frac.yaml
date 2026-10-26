@@ -32,6 +32,16 @@ load_cases:
     evacuation: full
     depletion: {pore_ppg: 6.0}
     cementing: true
+reference_designs:
+- name: illustrative design (spec 6.1 pipes)
+  source: 'SYNTHETIC: pipe sizes picked to exercise the checks, not an engineered design'
+  strings:
+    surface:
+    - {grade: L80, weight_lb_per_ft: 40.0, wall_in: 0.395}
+    intermediate:
+    - {grade: P110, weight_lb_per_ft: 26.0, wall_in: 0.362}
+    liner:
+    - {grade: P110, weight_lb_per_ft: 11.6, wall_in: 0.25}
 sources: {all: 'SYNTHETIC: generated test data, not from any real well.'}
 meta:
   synthetic: true
