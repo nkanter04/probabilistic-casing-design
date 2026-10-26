@@ -1,0 +1,53 @@
+# SYNTHETIC: generated test data, not from any real well.
+# Written by casingrel.synthetic; regenerate with `python -m casingrel.synthetic`. Do not edit by hand.
+well: {name: SYNTH-C-horizontal-frac, kb_ft: 25.0}
+trajectory: {landing_tvd_ft: 8700, build_deg_per_100ft: 8.0, lateral_ft: 7500}
+pore_pressure_ppg:
+  table: {0.0: 8.6, 6000.0: 8.6, 6450.0: 9.185, 6900.0: 9.439, 7350.0: 10.071, 7800.0: 10.505, 8250.0: 10.994,
+    8700.0: 11.5}
+  uncertainty: {dist: normal, shift_sd: 0.3}
+frac_gradient:
+  method: eaton
+  poisson: {0.0: 0.25, 8700.0: 0.3}
+overburden_psi_per_ft: 1.0
+temperature: {surface_F: 75.0, gradient_F_per_100ft: 1.4}
+strings:
+- {name: surface, hole_in: 12.25, od_in: 9.625, shoe_tvd_ft: 2000, toc: surface, mud_ppg: 8.8}
+- {name: intermediate, hole_in: 8.75, od_in: 7.0, shoe_md_ft: 7800, toc_ft: 1500, mud_ppg: 9.8}
+- {name: liner, hole_in: 6.125, od_in: 4.5, top_md_ft: 7600, shoe_md_ft: TD, toc_ft: 7600, mud_ppg: 12.0}
+fluids: {completion_ppg: 8.6, frac_fluid_ppg: 8.4, cement_lead_ppg: 12.5, cement_tail_ppg: 15.8, mix_water_ppg: 8.4}
+load_cases:
+  surface:
+    gas_kick: {gas_gradient_psi_per_ft: 0.1}
+    pressure_test: {surface_psi: 1500}
+    evacuation: full
+    cementing: true
+  intermediate:
+    frac_down_casing: {max_surface_psi: 9500, fluid_ppg: 8.4}
+    pressure_test: {surface_psi: 10000}
+    evacuation: full
+    cementing: true
+  liner:
+    frac_down_casing: {max_surface_psi: 9500, fluid_ppg: 8.4}
+    evacuation: full
+    depletion: {pore_ppg: 6.0}
+    cementing: true
+sources: {all: 'SYNTHETIC: generated test data, not from any real well.'}
+meta:
+  synthetic: true
+  generator: casingrel.synthetic
+  seed: 3
+  params:
+    td_tvd_ft: 8700
+    pore: {transition_tvd_ft: 6000, max_ppg: 11.5, normal_ppg: 8.6, ramp_points: 6, noise_sd_ppg: 0.05}
+    well_type: horizontal
+    build_deg_per_100ft: 8.0
+    lateral_ft: 7500
+    kb_ft: 25.0
+    poisson_surface: 0.25
+    poisson_td: 0.3
+    overburden_psi_per_ft: 1.0
+    surface_F: 75.0
+    gradient_F_per_100ft: 1.4
+    pore_shift_sd_ppg: 0.3
+  note: 'SYNTHETIC: generated test data, not from any real well.'

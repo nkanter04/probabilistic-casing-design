@@ -11,7 +11,27 @@ The full specification is [docs/spec.md](docs/spec.md). Read it before starting 
 ## How to treat the spec
 
 - An LLM generated the spec. Treat it as a strong starting point, not as gospel. A deviation is fine when it makes the result more accurate, more correct or easier to maintain, but record each one in [docs/decisions.md](docs/decisions.md) with the reason.
-- Section 5's package-layout diagram was lost when the spec was exported ("embedded content: package layout · 8 modules"). Agree on the module list with the user before building past the ratings stage.
+- Section 5's package-layout diagram was lost when the spec was exported. The user agreed this layout instead (2026-10-26):
+
+  ```
+  src/casingrel/
+    ratings.py      API burst/collapse/tension
+    schema.py       pydantic input model, YAML/JSON load + validation
+    units.py        pint conversions at the input/report boundary
+    trajectory.py   minimum-curvature survey, simple-plan builder
+    profiles.py     pore, frac (Eaton), overburden, temperature vs TVD
+    loads.py        load cases -> Pi(z), Pe(z); axial loads
+    design.py       setting depths, deterministic design factors
+    reliability.py  distributions, Monte Carlo, FORM
+    optimize.py     candidate strings, tapered search, cost
+    report.py       tables, plots, assumptions list
+    synthetic.py    synthetic-well generator
+    cli.py          casingrel run well.yaml -> report
+  examples/         bundled synthetic wells (generated; do not hand-edit)
+  catalogs/         pipe catalog CSV(s)
+  ```
+
+- Input files put the unit in the key (`kb_ft: 25`). Any value may instead be a string with its own unit ("7.6 m"), which pint converts on load.
 - Never change the user's design basis (setting depths, design factors, load cases) without asking first (spec §7 rule 7).
 
 ## Rules that matter most (from spec §7)

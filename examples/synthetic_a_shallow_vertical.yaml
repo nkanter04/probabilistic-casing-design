@@ -1,0 +1,46 @@
+# SYNTHETIC: generated test data, not from any real well.
+# Written by casingrel.synthetic; regenerate with `python -m casingrel.synthetic`. Do not edit by hand.
+well: {name: SYNTH-A-shallow-vertical, kb_ft: 25.0}
+trajectory: {td_ft: 6000}
+pore_pressure_ppg:
+  table: {0.0: 8.6, 6000.0: 8.6}
+  uncertainty: {dist: normal, shift_sd: 0.3}
+frac_gradient:
+  method: eaton
+  poisson: {0.0: 0.25, 6000.0: 0.3}
+overburden_psi_per_ft: 1.0
+temperature: {surface_F: 75.0, gradient_F_per_100ft: 1.4}
+strings:
+- {name: surface, hole_in: 12.25, od_in: 8.625, shoe_tvd_ft: 1200, toc: surface, mud_ppg: 8.8}
+- {name: production, hole_in: 7.875, od_in: 5.5, shoe_md_ft: TD, toc_ft: 900, mud_ppg: 9.2}
+fluids: {completion_ppg: 8.6, frac_fluid_ppg: 8.4, cement_lead_ppg: 12.5, cement_tail_ppg: 15.8, mix_water_ppg: 8.4}
+load_cases:
+  surface:
+    gas_kick: {gas_gradient_psi_per_ft: 0.1}
+    pressure_test: {surface_psi: 1500}
+    evacuation: full
+    cementing: true
+  production:
+    pressure_test: {surface_psi: 3000}
+    tubing_leak: {surface_psi: 2000, packer_fluid_ppg: 8.6}
+    evacuation: full
+    cementing: true
+sources: {all: 'SYNTHETIC: generated test data, not from any real well.'}
+meta:
+  synthetic: true
+  generator: casingrel.synthetic
+  seed: 1
+  params:
+    td_tvd_ft: 6000
+    pore: {transition_tvd_ft: 6000, max_ppg: 8.6, normal_ppg: 8.6, ramp_points: 6, noise_sd_ppg: 0.0}
+    well_type: vertical
+    build_deg_per_100ft: null
+    lateral_ft: 0.0
+    kb_ft: 25.0
+    poisson_surface: 0.25
+    poisson_td: 0.3
+    overburden_psi_per_ft: 1.0
+    surface_F: 75.0
+    gradient_F_per_100ft: 1.4
+    pore_shift_sd_ppg: 0.3
+  note: 'SYNTHETIC: generated test data, not from any real well.'
