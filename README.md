@@ -7,9 +7,15 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, and the deterministic design-factor check.
+> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, and the deterministic report.
 
-Regenerate the bundled synthetic wells with `python -m casingrel.synthetic`.
+## Usage
+
+```bash
+casingrel run examples/synthetic_c_horizontal_frac.yaml -o reports/well_c
+```
+
+This writes `report.md` (summary, setting depths and kick tolerance, design-factor tables, assumptions list), `plots/` and `design_factors.csv`. `casingrel synthetic` regenerates the bundled synthetic wells.
 
 ## Development
 

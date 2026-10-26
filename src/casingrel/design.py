@@ -21,9 +21,9 @@ import numpy as np
 
 from . import ratings as rt
 from .loads import PipeBody, StringGeometry, StringLoads, required_mud_ppg, resolve_strings, string_loads
-from .profiles import Profiles
+from .profiles import Profiles, build_profiles
 from .ratings import Pipe
-from .schema import Distribution, WellInput
+from .schema import Distribution, ReferenceDesign, WellInput
 from .units import PSI_PER_FT_PER_PPG
 
 SETTING_DEPTH_STEP_FT = 10.0
@@ -311,6 +311,108 @@ def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeo
         # and triaxial also change with P_s through ballooning).
         ps_max = float(np.min(burst_rating / df.burst - (frac.p_internal_psi - ps) + frac.p_external_psi))
     return StringCheck(name, pipe, rows, sl, ps_max, notes)
+
+
+# --- Whole-well deterministic run ------------------------------------------------------
+
+@dataclass
+class WellCheck:
+    """Deterministic run of one well: depths, every string's loads and, where a
+    pipe is assigned, its design-factor check."""
+
+    well: WellInput
+    profiles: Profiles
+    depths: SettingDepthResult
+    geometries: list[StringGeometry]
+    design_name: str | None
+    checks: dict[str, StringCheck]  # strings with a pipe
+    loads: dict[str, StringLoads]  # every string
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool | None:
+        """True or False when every string has a pipe; None when some are unchecked."""
+        if len(self.checks) < len(self.geometries):
+            return None
+        return all(c.ok for c in self.checks.values())
+
+
+def design_pipes(well: WellInput, design: str | None = None) -> tuple[str | None, dict[str, Pipe], list[str]]:
+    """Pipes for each string from a reference design in the input (the first one by default)."""
+    if not well.reference_designs:
+        return None, {}, ["no reference design in the input; loads are reported without pipe checks"]
+    ref = _pick_design(well.reference_designs, design)
+    notes: list[str] = []
+    pipes: dict[str, Pipe] = {}
+    od_by_name = {s.name: s.od_in for s in well.strings}
+    for name, sections in ref.strings.items():
+        if len(sections) != 1:
+            notes.append(f"{name}: tapered strings ({len(sections)} sections) are not checked yet")
+            continue
+        sec = sections[0]
+        od = sec.od_in if sec.od_in is not None else od_by_name[name]
+        if abs(od - od_by_name[name]) > 1e-6:
+            notes.append(f"{name}: design OD {od:g} in differs from the string's {od_by_name[name]:g} in")
+        if sec.wall_in is None:
+            notes.append(f"{name}: reference design gives no wall_in; string not checked")
+            continue
+        try:
+            pipes[name] = Pipe(od, sec.wall_in, sec.weight_lb_per_ft, sec.grade, yield_psi=sec.yield_psi,
+                               drift_in=sec.drift_in, connection=sec.connection,
+                               conn_tension_lbf=sec.conn_tension_lbf, conn_compression_lbf=sec.conn_compression_lbf,
+                               conn_internal_psi=sec.conn_internal_psi)
+        except ValueError as exc:
+            notes.append(f"{name}: {exc}; string not checked")
+    return ref.name, pipes, notes
+
+
+def _pick_design(designs: list[ReferenceDesign], name: str | None) -> ReferenceDesign:
+    if name is None:
+        return designs[0]
+    for d in designs:
+        if d.name == name:
+            return d
+    raise ValueError(f"no reference design named {name!r}; have {[d.name for d in designs]}")
+
+
+def drift_notes(well: WellInput, geometries: list[StringGeometry], pipes: dict[str, Pipe]) -> list[str]:
+    """Flag pipes whose drift does not pass the next hole section's bit."""
+    out = []
+    for g in geometries:
+        pipe = pipes.get(g.name)
+        if pipe is None or g.kind in ("liner", "tieback"):
+            continue
+        deeper = [s for s in well.strings if s.kind != "tieback" and s.od_in < g.od_in
+                  and s.hole_in < g.od_in]
+        if not deeper:
+            continue
+        bit_in = deeper[0].hole_in
+        if pipe.drift_in is None:
+            out.append(f"{g.name}: no drift_in given; cannot confirm the {bit_in:g}-in bit passes "
+                       f"(ID {pipe.id_in:.3f} in)")
+        elif pipe.drift_in < bit_in - 1e-9:
+            out.append(f"{g.name}: drift {pipe.drift_in:.3f} in is smaller than the next bit "
+                       f"({bit_in:g} in); a special-drift pipe or a smaller bit is needed")
+    return out
+
+
+def check_well(well: WellInput, design: str | None = None, profiles: Profiles | None = None,
+               yield_derate: YieldDerate | None = None) -> WellCheck:
+    """Run the deterministic pipeline: profiles, setting depths, loads and design factors."""
+    profiles = build_profiles(well) if profiles is None else profiles
+    depths = setting_depths(well, profiles)
+    geoms, _ = resolve_strings(well, profiles.survey, profiles, depths.chosen_tvd_ft)
+    design_name, pipes, notes = design_pipes(well, design)
+    notes += drift_notes(well, geoms, pipes)
+    checks: dict[str, StringCheck] = {}
+    loads: dict[str, StringLoads] = {}
+    for g in geoms:
+        if g.name in pipes:
+            checks[g.name] = check_string(well, profiles, geoms, g.name, pipes[g.name], yield_derate)
+            loads[g.name] = checks[g.name].loads
+        else:
+            loads[g.name] = string_loads(well, profiles, geoms, g.name)
+    return WellCheck(well, profiles, depths, geoms, design_name, checks, loads, notes)
 
 
 def _axial_rows(row, case: str, axial_lbf, bend_lbf, tension_rating, comp_rating, df) -> None:
