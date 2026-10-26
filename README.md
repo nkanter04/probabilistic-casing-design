@@ -7,7 +7,9 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Done: pipe-body ratings (`casingrel.ratings`) with tests.
+> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, and the synthetic-well generator with three bundled test wells in [examples/](examples/).
+
+Regenerate the bundled synthetic wells with `python -m casingrel.synthetic`.
 
 ## Development
 
