@@ -7,6 +7,14 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Nothing has been built yet.
+> **Status:** early development. Done: pipe-body ratings (`casingrel.ratings`) with tests.
+
+## Development
+
+```bash
+python -m venv .venv
+.venv/Scripts/python -m pip install -e ".[dev]"   # on macOS/Linux: .venv/bin/python
+.venv/Scripts/python -m pytest
+```
 
 > **Disclaimer:** this is a student design tool. It is not for field use without review by a licensed engineer and the operator's own standards.
