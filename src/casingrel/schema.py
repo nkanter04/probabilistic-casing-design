@@ -70,6 +70,8 @@ class Distribution(_Model):
     low: float | None = None
     mode: float | None = None
     high: float | None = None
+    lower: float | None = None  # optional truncation bounds (normal, lognormal)
+    upper: float | None = None
     unit: str | None = None
 
     @model_validator(mode="after")
@@ -87,6 +89,10 @@ class Distribution(_Model):
             raise ValueError("low must be less than high")
         if self.mode is not None and not self.low <= self.mode <= self.high:
             raise ValueError("mode must lie between low and high")
+        if (self.lower is not None or self.upper is not None) and self.dist not in ("normal", "lognormal"):
+            raise ValueError("lower/upper truncation applies to normal and lognormal only")
+        if self.lower is not None and self.upper is not None and not self.lower < self.upper:
+            raise ValueError("lower must be less than upper")
         return self
 
     @property
@@ -108,7 +114,8 @@ class Distribution(_Model):
 
         sd = None if self.sd is None else convert_spread(self.mean, self.sd, self.unit, unit, scale)
         return Distribution(dist=self.dist, mean=conv(self.mean), sd=sd, low=conv(self.low),
-                            mode=conv(self.mode), high=conv(self.high))
+                            mode=conv(self.mode), high=conv(self.high), lower=conv(self.lower),
+                            upper=conv(self.upper))
 
 
 def _uq(unit: str, scale: float = 1.0) -> BeforeValidator:
@@ -576,6 +583,24 @@ class Correlation(_Model):
     rho: float = Field(ge=-1.0, le=1.0)
 
 
+def _ratio_dist(v: Any) -> Any:
+    return v if isinstance(v, Distribution) else Distribution.model_validate(v)
+
+
+RatioDist = Annotated[Distribution, BeforeValidator(_ratio_dist)]
+
+
+class PipeStatistics(_Model):
+    """Manufacturing variability as ratios: actual yield / minimum yield, actual
+    OD / nominal OD, actual wall / nominal wall (spec 2.2). The same ratios
+    apply to every pipe. Source: ISO/TR 10400:2018 or Gouveia et al. (2020),
+    Table 1. Missing entries fall back to labelled placeholders."""
+
+    yield_ratio: RatioDist | None = None
+    od_ratio: RatioDist | None = None
+    wall_ratio: RatioDist | None = None
+
+
 class Meta(_Model):
     synthetic: bool = False
     generator: str | None = None
@@ -603,6 +628,7 @@ class WellInput(_Model):
     reference_designs: list[ReferenceDesign] = []
     regulatory: list[str] = []
     correlations: list[Correlation] = []
+    pipe_statistics: PipeStatistics = PipeStatistics()
     sources: dict[str, str] = {}
     meta: Meta = Meta()
 

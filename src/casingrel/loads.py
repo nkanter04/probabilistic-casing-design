@@ -28,7 +28,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import ArrayLike
 
-from .profiles import Profiles, ppg_to_psi
+from .profiles import Profiles, ProfileView, ppg_to_psi
 from .schema import (Cementing, CasingString, Depletion, Distribution, Evacuation, FracDownCasing,
                      GasKick, LostReturns, PressureTest, Running, StringLoadCases, TubingLeak,
                      WellInput)
@@ -117,6 +117,7 @@ class StringGeometry:
     outer_shoe_tvd_ft: float | None  # shoe of the next string outward
     next_td_tvd_ft: float | None  # TD of the next (deeper) hole section
     next_mud_ppg: float | None
+    next_name: str | None = None
 
 
 def resolve_strings(well: WellInput, survey: Survey, profiles: Profiles,
@@ -160,6 +161,7 @@ def resolve_strings(well: WellInput, survey: Survey, profiles: Profiles,
         deeper = [d for d in nested if d["od_in"] < r["od_in"] and d["shoe_tvd_ft"] > r["shoe_tvd_ft"]]
         r["next_td_tvd_ft"] = deeper[0]["shoe_tvd_ft"] if deeper else None
         r["next_mud_ppg"] = deeper[0]["mud_ppg"] if deeper else None
+        r["next_name"] = deeper[0]["name"] if deeper else None
     return [StringGeometry(**r) for r in resolved], notes
 
 
@@ -369,94 +371,151 @@ def active_cases(kind: str, settings: StringLoadCases | None) -> dict[str, objec
     return out
 
 
+@dataclass(frozen=True)
+class Realization:
+    """Sampled values for uncertain inputs, each shaped (n, 1) (Monte Carlo batch
+    or FORM points). Keys are input paths such as "strings.surface.mud_ppg",
+    "fluids.mix_water_ppg" or "load_cases.production.frac_down_casing.max_surface_psi",
+    plus the profile modifiers in PROFILE_KEYS. Inputs that are not sampled use
+    their base values, so loads with an empty Realization equal the deterministic loads."""
+
+    values: dict[str, np.ndarray] = field(default_factory=dict)
+
+    def profile_view(self, profiles: Profiles) -> ProfileView:
+        v = self.values
+        return ProfileView(profiles, v.get("pore.shift_ppg", 0.0), v.get("pore.scale", 1.0),
+                           v.get("poisson.shift", 0.0), v.get("poisson.scale", 1.0),
+                           v.get("overburden.scale", 1.0), v.get("temperature.surface_F"),
+                           v.get("temperature.gradient_F_per_100ft"))
+
+
+PROFILE_KEYS = ("pore.shift_ppg", "pore.scale", "poisson.shift", "poisson.scale", "overburden.scale",
+                "temperature.surface_F", "temperature.gradient_F_per_100ft")
+
+
 def string_loads(well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
-                 pipe: PipeBody | None = None) -> StringLoads:
-    """All load cases for one string at base values. With a pipe, also the axial loads."""
+                 pipe: PipeBody | None = None, realization: Realization | None = None) -> StringLoads:
+    """All load cases for one string. With a pipe, also the axial loads.
+
+    Without a realization every input is at its base value and each profile is
+    shaped (n_nodes,). With one, sampled inputs are (n, 1) arrays and the
+    profiles broadcast to (n, n_nodes).
+    """
     g = next(x for x in geometries if x.name == name)
+    real = realization or Realization()
+    prof = real.profile_view(profiles) if realization is not None else profiles
     survey = profiles.survey
     md = node_md(g, survey)
     pts = survey.at_md(md)
     tvd = pts.tvd_ft
     notes: list[str] = []
     fl = well.fluids
-    pore = profiles.pore_psi(tvd)
-    mix_water = _value(fl.mix_water_ppg, PLACEHOLDER_MIX_WATER_PPG, "fluids.mix_water_ppg", notes)
-    burst_pe = burst_backup_psi(tvd, g.mud_ppg, g.toc_tvd_ft, g.outer_shoe_tvd_ft, mix_water, pore)
-    collapse_pe = collapse_backup_psi(tvd, g.mud_ppg, pore)
-    completion = _base(fl.completion_ppg) if fl.completion_ppg is not None else None
+
+    def value(path: str, x, default=None, label: str | None = None):
+        """Sampled value at `path` if x is uncertain and sampled, else x's base value."""
+        if x is None:
+            if label is not None:
+                notes.append(f"{label} not given; used {default:g} (placeholder)")
+            return default
+        if isinstance(x, Distribution) and path in real.values:
+            return real.values[path]
+        return _base(x)
+
+    spec = next(s for s in well.strings if s.name == name)
+    mud = value(f"strings.{name}.mud_ppg", spec.mud_ppg, g.mud_ppg)
+    next_mud = None
+    if g.next_name is not None:
+        nxt = next(s for s in well.strings if s.name == g.next_name)
+        next_mud = value(f"strings.{g.next_name}.mud_ppg", nxt.mud_ppg, g.next_mud_ppg)
+    pore = prof.pore_psi(tvd)
+    mix_water = value("fluids.mix_water_ppg", fl.mix_water_ppg, PLACEHOLDER_MIX_WATER_PPG, "fluids.mix_water_ppg")
+    burst_pe = burst_backup_psi(tvd, mud, g.toc_tvd_ft, g.outer_shoe_tvd_ft, mix_water, pore)
+    collapse_pe = collapse_backup_psi(tvd, mud, pore)
+    completion = value("fluids.completion_ppg", fl.completion_ppg)
     cases: list[LoadCase] = []
     settings = active_cases(g.kind, well.load_cases.get(name))
 
-    def add(case: str, mode: str, pi: np.ndarray, pe: np.ndarray) -> None:
-        cases.append(LoadCase(case, mode, md, tvd, np.broadcast_to(pi, tvd.shape).copy(),
-                              np.broadcast_to(pe, tvd.shape).copy()))
+    def add(case: str, mode: str, pi, pe) -> None:
+        shape = np.broadcast_shapes(np.shape(pi), np.shape(pe), tvd.shape)
+        cases.append(LoadCase(case, mode, md, tvd, np.broadcast_to(pi, shape).copy(),
+                              np.broadcast_to(pe, shape).copy()))
 
     for case, cfg in settings.items():
+        path = f"load_cases.{name}.{case}"
         if case == "gas_kick":
             if g.next_td_tvd_ft is None:
                 notes.append(f"{name}: gas_kick skipped (no deeper hole section)")
                 continue
-            grad = _value(cfg.gas_gradient_psi_per_ft, PLACEHOLDER_GAS_GRADIENT_PSI_PER_FT,
-                          f"{name}.gas_kick.gas_gradient_psi_per_ft", notes)
-            ki = _base(cfg.kick_intensity_ppg) if cfg.kick_intensity_ppg is not None else 0.0
+            grad = value(f"{path}.gas_gradient_psi_per_ft", cfg.gas_gradient_psi_per_ft,
+                         PLACEHOLDER_GAS_GRADIENT_PSI_PER_FT, f"{name}.gas_kick.gas_gradient_psi_per_ft")
+            ki = value(f"{path}.kick_intensity_ppg", cfg.kick_intensity_ppg, 0.0)
             if cfg.kick_volume_bbl is not None:
                 notes.append(f"{name}: kick volume model not built yet; used full gas to surface (conservative)")
-            p_res = hydrostatic_psi(profiles.pore_ppg(g.next_td_tvd_ft) + ki, g.next_td_tvd_ft)
+            p_res = hydrostatic_psi(prof.pore_ppg(g.next_td_tvd_ft) + ki, g.next_td_tvd_ft)
             pi = gas_to_surface_psi(tvd, p_res, g.next_td_tvd_ft, grad)
             if cfg.limit_to_shoe_frac:
-                p_shoe = min(float(gas_to_surface_psi(g.shoe_tvd_ft, p_res, g.next_td_tvd_ft, grad)),
-                             float(profiles.frac_psi(g.shoe_tvd_ft)))
+                p_shoe = np.minimum(gas_to_surface_psi(g.shoe_tvd_ft, p_res, g.next_td_tvd_ft, grad),
+                                    prof.frac_psi(g.shoe_tvd_ft))
                 pi = gas_to_surface_psi(tvd, p_shoe, g.shoe_tvd_ft, grad)
             add(case, BURST, pi, burst_pe)
         elif case == "lost_returns":
             if g.next_td_tvd_ft is None:
                 notes.append(f"{name}: lost_returns skipped (no deeper hole section)")
                 continue
-            water = _value(cfg.fluid_ppg, PLACEHOLDER_WATER_PPG, f"{name}.lost_returns.fluid_ppg", notes)
-            p_frac_shoe = float(profiles.frac_psi(g.shoe_tvd_ft))
-            add(case, BURST, column_below_psi(tvd, p_frac_shoe, g.shoe_tvd_ft, water), burst_pe)
+            water = value(f"{path}.fluid_ppg", cfg.fluid_ppg, PLACEHOLDER_WATER_PPG, f"{name}.lost_returns.fluid_ppg")
+            add(case, BURST, column_below_psi(tvd, prof.frac_psi(g.shoe_tvd_ft), g.shoe_tvd_ft, water), burst_pe)
         elif case == "pressure_test":
-            fluid = _base(cfg.fluid_ppg) if cfg.fluid_ppg is not None else _default_fluid(g, completion)
-            add(case, BURST, surface_pressure_column_psi(tvd, _base(cfg.surface_psi), fluid), burst_pe)
-        elif case == "frac_down_casing":
-            add(case, BURST, surface_pressure_column_psi(tvd, _base(cfg.max_surface_psi), _base(cfg.fluid_ppg)),
+            fluid = value(f"{path}.fluid_ppg", cfg.fluid_ppg, _default_fluid(g, mud, completion))
+            add(case, BURST, surface_pressure_column_psi(tvd, value(f"{path}.surface_psi", cfg.surface_psi), fluid),
                 burst_pe)
+        elif case == "frac_down_casing":
+            add(case, BURST, surface_pressure_column_psi(tvd, value(f"{path}.max_surface_psi", cfg.max_surface_psi),
+                                                         value(f"{path}.fluid_ppg", cfg.fluid_ppg)), burst_pe)
         elif case == "tubing_leak":
-            fluid = (_base(cfg.packer_fluid_ppg) if cfg.packer_fluid_ppg is not None
-                     else _value(fl.completion_ppg, g.mud_ppg, "packer fluid (mud used)", notes))
-            add(case, BURST, surface_pressure_column_psi(tvd, _base(cfg.surface_psi), fluid), burst_pe)
+            fluid = value(f"{path}.packer_fluid_ppg", cfg.packer_fluid_ppg,
+                          completion if completion is not None else mud)
+            if cfg.packer_fluid_ppg is None:
+                notes.append(f"{name}: tubing_leak packer fluid not given; used "
+                             f"{'completion fluid' if completion is not None else 'mud'} (placeholder)")
+            add(case, BURST, surface_pressure_column_psi(tvd, value(f"{path}.surface_psi", cfg.surface_psi), fluid),
+                burst_pe)
         elif case == "evacuation":
-            level = _base(cfg.level_ft) if cfg.level_ft is not None else None
-            fluid = g.next_mud_ppg or completion or g.mud_ppg
+            level = value(f"{path}.level_ft", cfg.level_ft)
+            fluid = next(f for f in (next_mud, completion, mud) if f is not None)
             add(case, COLLAPSE, evacuated_psi(tvd, level, fluid), collapse_pe)
         elif case == "cementing":
-            slurries = [_base(x) for x in (fl.cement_lead_ppg, fl.cement_tail_ppg) if x is not None]
+            slurries = [value(f"fluids.{k}", x) for k, x in
+                        (("cement_lead_ppg", fl.cement_lead_ppg), ("cement_tail_ppg", fl.cement_tail_ppg))
+                        if x is not None]
             if not slurries:
                 notes.append(f"{name}: no cement density given; used {PLACEHOLDER_SLURRY_PPG} ppg (placeholder)")
-            slurry = max(slurries, default=PLACEHOLDER_SLURRY_PPG)
-            disp = _base(cfg.displacement_ppg) if cfg.displacement_ppg is not None else g.mud_ppg
-            add(case, COLLAPSE, hydrostatic_psi(disp, tvd), cementing_external_psi(tvd, g.mud_ppg, g.toc_tvd_ft, slurry))
+            slurry = PLACEHOLDER_SLURRY_PPG if not slurries else (
+                slurries[0] if len(slurries) == 1 else np.maximum(*slurries))
+            disp = value(f"{path}.displacement_ppg", cfg.displacement_ppg, mud)
+            add(case, COLLAPSE, hydrostatic_psi(disp, tvd), cementing_external_psi(tvd, mud, g.toc_tvd_ft, slurry))
         elif case == "depletion":
-            fluid = _value(fl.completion_ppg, PLACEHOLDER_WATER_PPG, f"{name}.depletion fluid (completion_ppg)", notes)
-            p_dep = hydrostatic_psi(_base(cfg.pore_ppg), g.shoe_tvd_ft)
+            fluid = value("fluids.completion_ppg", fl.completion_ppg, PLACEHOLDER_WATER_PPG,
+                          f"{name}.depletion fluid (completion_ppg)")
+            p_dep = hydrostatic_psi(value(f"{path}.pore_ppg", cfg.pore_ppg), g.shoe_tvd_ft)
             pi = column_below_psi(tvd, p_dep, g.shoe_tvd_ft, fluid)
             if cfg.annulus_level_ft is not None:
-                pi = np.minimum(pi, evacuated_psi(tvd, _base(cfg.annulus_level_ft), fluid))
+                pi = np.minimum(pi, evacuated_psi(tvd, value(f"{path}.annulus_level_ft", cfg.annulus_level_ft), fluid))
             add(case, COLLAPSE, pi, collapse_pe)
 
-    loads = StringLoads(geometry=g, md_ft=md, tvd_ft=tvd, temperature_F=profiles.temperature_F(tvd),
+    loads = StringLoads(geometry=g, md_ft=md, tvd_ft=tvd, temperature_F=prof.temperature_F(tvd),
                         dls_deg_per_100ft=pts.dls_deg_per_100ft, cases=cases, notes=notes)
     if pipe is None:
         return loads
-    return _with_axial(loads, settings, pipe, profiles.temperature_F(0.0), well, notes)
+    return _with_axial(loads, settings, pipe, mud, prof.temperature_F(0.0),
+                       float(profiles.temperature_F(0.0)), value, notes)
 
 
-def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, surface_F: float,
-                well: WellInput, notes: list[str]) -> StringLoads:
+def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, mud, surface_F, surface_F_base: float,
+                value, notes: list[str]) -> StringLoads:
     """Add installation, running and service axial loads for one pipe."""
     g, md, tvd = loads.geometry, loads.md_ft, loads.tvd_ft
-    p_ref = hydrostatic_psi(g.mud_ppg, tvd)  # inside and outside when the cement sets
-    eff0 = effective_tension_lbf(tvd, g.shoe_tvd_ft, pipe.weight_lb_per_ft, g.mud_ppg)
+    p_ref = hydrostatic_psi(mud, tvd)  # inside and outside when the cement sets
+    eff0 = effective_tension_lbf(tvd, g.shoe_tvd_ft, pipe.weight_lb_per_ft, mud)
     real0 = real_axial_lbf(eff0, p_ref, p_ref, pipe)
     axial = [AxialCase("installation", md, tvd, real0, eff0)]
 
@@ -479,10 +538,10 @@ def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, surface_F: f
                                            _avg(md, c.p_external_psi - p_ref, free), pipe)
             if c.name == "frac_down_casing":
                 cfg = settings["frac_down_casing"]
-                t_inj = _base(cfg.fluid_temp_F) if cfg.fluid_temp_F is not None else surface_F
+                t_inj = value(f"load_cases.{g.name}.frac_down_casing.fluid_temp_F", cfg.fluid_temp_F, surface_F)
                 if cfg.fluid_temp_F is None:
                     notes.append(f"{g.name}: frac fluid temperature not given; used surface temperature "
-                                 f"{surface_F:.0f} F (placeholder, maximum cooling)")
+                                 f"{surface_F_base:.0f} F (placeholder, maximum cooling)")
                 d_force = d_force + thermal_force_lbf(pipe.area_steel_in2,
                                                       _avg(md, t_inj - loads.temperature_F, free))
         cases.append(LoadCase(c.name, c.mode, md, tvd, c.p_internal_psi, c.p_external_psi,
@@ -493,24 +552,18 @@ def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, surface_F: f
                        notes=notes)
 
 
-def _avg(md: np.ndarray, y: np.ndarray, mask: np.ndarray) -> float:
-    """MD-weighted average of y over the masked nodes."""
-    x, v = md[mask], y[mask]
-    return float(np.trapezoid(v, x) / (x[-1] - x[0]))
+def _avg(md: np.ndarray, y: ArrayLike, mask: np.ndarray) -> np.ndarray:
+    """MD-weighted average of y over the masked nodes (last axis), kept as (..., 1)."""
+    x = md[mask]
+    v = np.broadcast_to(y, np.broadcast_shapes(np.shape(y), md.shape))[..., mask]
+    return np.trapezoid(v, x, axis=-1)[..., None] / (x[-1] - x[0])
 
 
-def _default_fluid(g: StringGeometry, completion: float | None) -> float:
+def _default_fluid(g: StringGeometry, mud, completion):
     if g.kind in ("production", "liner", "tieback") and completion is not None:
         return completion
-    return g.mud_ppg
+    return mud
 
 
 def _base(x: float | Distribution) -> float:
     return x.base if isinstance(x, Distribution) else float(x)
-
-
-def _value(x: float | Distribution | None, default: float, label: str, notes: list[str]) -> float:
-    if x is not None:
-        return _base(x)
-    notes.append(f"{label} not given; used {default:g} (placeholder)")
-    return default

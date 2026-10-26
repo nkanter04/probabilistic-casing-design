@@ -7,7 +7,7 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, and the deterministic report.
+> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, the deterministic report, and probability of failure by Monte Carlo and FORM (`casingrel.reliability`).
 
 ## Usage
 
