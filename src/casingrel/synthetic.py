@@ -164,7 +164,7 @@ def bundled_wells() -> dict[str, SyntheticWellParams]:
         poisson_surface=0.25, poisson_td=0.30,
         strings=[
             {"name": "surface", "hole_in": 12.25, "od_in": 8.625, "shoe_tvd_ft": 1_200, "toc": "surface",
-             "mud_ppg": 8.8},
+             "mud_ppg": 9.1},
             {"name": "production", "hole_in": 7.875, "od_in": 5.5, "shoe_md_ft": "TD", "toc_ft": 900,
              "mud_ppg": 9.2},
         ],
@@ -185,7 +185,7 @@ def bundled_wells() -> dict[str, SyntheticWellParams]:
         strings=[
             {"name": "conductor", "hole_in": 26.0, "od_in": 20.0, "shoe_tvd_ft": 150, "toc": "surface"},
             {"name": "surface", "hole_in": 17.5, "od_in": 13.375, "shoe_tvd_ft": 3_000, "toc": "surface",
-             "mud_ppg": 9.0},
+             "mud_ppg": 9.1},
             {"name": "intermediate_1", "hole_in": 12.25, "od_in": 9.625, "shoe_tvd_ft": "choose",
              "toc_ft": 2_500},
             {"name": "intermediate_2", "hole_in": 8.5, "od_in": 7.0, "shoe_tvd_ft": "choose",
@@ -214,10 +214,10 @@ def bundled_wells() -> dict[str, SyntheticWellParams]:
         pore=PoreProfile(transition_tvd_ft=6_000, max_ppg=11.5, noise_sd_ppg=0.05),
         poisson_surface=0.25, poisson_td=0.30,
         strings=[
-            {"name": "surface", "hole_in": 12.25, "od_in": 9.625, "shoe_tvd_ft": 2_000, "toc": "surface",
-             "mud_ppg": 8.8},
-            {"name": "intermediate", "hole_in": 8.75, "od_in": 7.0, "shoe_md_ft": 7_800, "toc_ft": 1_500,
-             "mud_ppg": 9.8},
+            {"name": "surface", "hole_in": 12.25, "od_in": 9.625, "shoe_tvd_ft": 3_000, "toc": "surface",
+             "mud_ppg": 9.1},
+            {"name": "intermediate", "hole_in": 8.75, "od_in": 7.0, "shoe_md_ft": 7_800, "toc_ft": 2_500,
+             "mud_ppg": 11.0},
             {"name": "liner", "hole_in": 6.125, "od_in": 4.5, "top_md_ft": 7_600, "shoe_md_ft": "TD",
              "toc_ft": 7_600, "mud_ppg": 12.0},
         ],

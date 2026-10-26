@@ -1,0 +1,353 @@
+"""Setting depths (spec 3.1) and the deterministic design-factor check (spec 3.6).
+
+Setting depths: the operational mud window is pore pressure + trip margin
+(lowest usable mud) to fracture gradient - kick margin (highest usable mud).
+The top-down method sets each "choose" shoe as deep as the open hole below
+the previous shoe can be drilled: the mud needed for the deepest pore
+pressure must stay below the weakest fracture gradient in that open hole.
+Each shoe is then checked for kick tolerance.
+
+Design check: for each string, node and load case, design factor =
+rating / load, compared with the input's design factors. Signs follow
+loads.py: tension positive, burst load Pi - Pe, collapse load Pe - Pi.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+
+from . import ratings as rt
+from .loads import PipeBody, StringGeometry, StringLoads, required_mud_ppg, resolve_strings, string_loads
+from .profiles import Profiles
+from .ratings import Pipe
+from .schema import Distribution, WellInput
+from .units import PSI_PER_FT_PER_PPG
+
+SETTING_DEPTH_STEP_FT = 10.0
+# Kick intensity each shoe must tolerate when the input gives none (placeholder, noted).
+PLACEHOLDER_KICK_INTENSITY_PPG = 0.5
+
+
+# --- Setting depths ------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MudWindow:
+    tvd_ft: np.ndarray
+    min_mud_ppg: np.ndarray  # pore + trip margin
+    max_mud_ppg: np.ndarray  # frac - kick margin
+
+
+def mud_window(profiles: Profiles, trip_margin_ppg: float, kick_margin_ppg: float,
+               tvd_ft: np.ndarray) -> MudWindow:
+    z = np.asarray(tvd_ft, dtype=float)
+    return MudWindow(z, profiles.pore_ppg(z) + trip_margin_ppg, profiles.frac_ppg(z) - kick_margin_ppg)
+
+
+def deepest_reachable_tvd(profiles: Profiles, trip_margin_ppg: float, kick_margin_ppg: float,
+                          shoe_tvd_ft: float, limit_tvd_ft: float, kick_intensity_ppg: float | None = None,
+                          influx_height_ft: float = 0.0, gas_gradient_psi_per_ft: float = 0.1,
+                          step_ft: float = SETTING_DEPTH_STEP_FT) -> float:
+    """Deepest TVD (on a step_ft grid, rounded down) that can be drilled below a shoe.
+
+    Open hole [shoe, z] is drillable when the mud needed for its highest pore
+    pressure is no heavier than its weakest fracture gradient allows:
+    max(pore + trip) <= min(frac - kick) over the open hole, shoe included.
+    With kick_intensity_ppg, the shoe must also tolerate that kick taken at z.
+    """
+    z = np.append(np.arange(shoe_tvd_ft, limit_tvd_ft, step_ft), limit_tvd_ft)
+    w = mud_window(profiles, trip_margin_ppg, kick_margin_ppg, z)
+    # Mud for drilling to z, in the 0.1 ppg steps that resolve_strings will use.
+    need = required_mud_ppg(np.maximum.accumulate(profiles.pore_ppg(z)), trip_margin_ppg)
+    allow = np.minimum.accumulate(w.max_mud_ppg)
+    ok = need <= allow + 1e-9
+    if kick_intensity_ppg is not None and shoe_tvd_ft > 0:
+        kt = kick_tolerance_ppg(shoe_tvd_ft, float(profiles.frac_ppg(shoe_tvd_ft)), np.maximum(z, 1e-9),
+                                need, influx_height_ft, gas_gradient_psi_per_ft)
+        ok &= (kt >= kick_intensity_ppg - 1e-9) | (z <= shoe_tvd_ft)
+    ok = np.logical_and.accumulate(ok)
+    if ok.all():
+        return float(limit_tvd_ft)
+    first_bad = int(np.argmin(ok))
+    return float(z[first_bad - 1]) if first_bad > 0 else float(shoe_tvd_ft)
+
+
+@dataclass(frozen=True)
+class KickTolerance:
+    string: str
+    shoe_tvd_ft: float
+    next_td_tvd_ft: float
+    next_mud_ppg: float
+    tolerance_ppg: float  # largest kick intensity the shoe can take
+    required_ppg: float
+
+    @property
+    def ok(self) -> bool:
+        return self.tolerance_ppg >= self.required_ppg - 1e-9
+
+
+def kick_tolerance_ppg(shoe_tvd_ft: float, frac_shoe_ppg: float, next_td_tvd_ft: float, mud_ppg: float,
+                       influx_height_ft: float = 0.0, gas_gradient_psi_per_ft: float = 0.1) -> float:
+    """Largest kick intensity (ppg over the mud) that can be shut in without breaking down the shoe.
+
+    KT = (D_shoe / D_td)(FG_shoe - MW) - (h / D_td)(MW - rho_gas), with an
+    influx of height h at TD (h = 0 gives the intensity-only form).
+    TODO(citation): confirm the form and equation number against Bourgoyne et al. (1986).
+    """
+    rho_gas_ppg = gas_gradient_psi_per_ft / PSI_PER_FT_PER_PPG
+    return ((shoe_tvd_ft / next_td_tvd_ft) * (frac_shoe_ppg - mud_ppg)
+            - (influx_height_ft / next_td_tvd_ft) * (mud_ppg - rho_gas_ppg))
+
+
+@dataclass
+class SettingDepthResult:
+    chosen_tvd_ft: dict[str, float]  # shoe TVD for each "choose" string
+    shoe_tvd_ft: dict[str, float]  # every nested string's shoe
+    kick_tolerance: list[KickTolerance]
+    warnings: list[str] = field(default_factory=list)
+
+
+def setting_depths(well: WellInput, profiles: Profiles, influx_height_ft: float = 0.0) -> SettingDepthResult:
+    """Top-down setting depths for "choose" shoes, with kick tolerance.
+
+    Each chosen shoe goes as deep as the mud window allows below the shoe
+    above it, and no deeper than that shoe's kick tolerance allows (bottom-up
+    kick-tolerance check, spec 3.1). Fixed shoes are kept and only checked.
+    """
+    survey = profiles.survey
+    trip, kick = well.margins.trip_margin_ppg, well.margins.kick_margin_ppg
+    nested = [s for s in well.strings if s.kind != "tieback"]
+
+    def fixed_tvd(s) -> float | None:
+        v = s.shoe_value
+        if v == "choose":
+            return None
+        if v == "TD":
+            return survey.td_tvd_ft
+        return float(survey.tvd_at_md(v)[0]) if s.shoe_md_ft is not None else float(v)
+
+    fixed = [fixed_tvd(s) for s in nested]
+    chosen: dict[str, float] = {}
+    shoes: dict[str, float] = {}
+    warnings: list[str] = []
+    prev_name, prev_tvd, prev_kick = "surface", 0.0, (None, 0.1)
+    for i, s in enumerate(nested):
+        reach = deepest_reachable_tvd(profiles, trip, kick, prev_tvd, survey.max_tvd_ft, prev_kick[0],
+                                      influx_height_ft, prev_kick[1])
+        if fixed[i] is not None:
+            shoe = fixed[i]
+            if shoe > reach + 1e-6:
+                warnings.append(f"{s.name}: shoe at {shoe:.0f} ft TVD is below the deepest depth drillable "
+                                f"from {prev_name} ({reach:.0f} ft TVD); an extra string or a shallower shoe is needed")
+        else:
+            limit = next((f for f in fixed[i + 1:] if f is not None), survey.max_tvd_ft)
+            shoe = min(reach, limit)
+            if shoe >= limit - 1e-6:
+                warnings.append(f"{s.name}: the hole below {prev_name} reaches {limit:.0f} ft TVD without it; "
+                                f"this string is not needed by the mud window")
+            if shoe <= prev_tvd + 1e-6:
+                warnings.append(f"{s.name}: no drillable depth below {prev_name} at {prev_tvd:.0f} ft TVD")
+            chosen[s.name] = shoe
+        shoes[s.name] = shoe
+        prev_name, prev_tvd = s.name, shoe
+        has_deeper = i + 1 < len(nested)
+        prev_kick = (_required_kick(well, s.name, warnings) if has_deeper and s.kind != "conductor" else None,
+                     _gas_gradient(well, s.name))
+
+    geoms, notes = resolve_strings(well, survey, profiles, chosen)
+    by_name = {g.name: g for g in geoms}
+    for s in nested:
+        g = by_name[s.name]
+        z = np.linspace(g.outer_shoe_tvd_ft or 0.0, g.shoe_tvd_ft, 200)
+        need = float(required_mud_ppg(profiles.pore_ppg(z).max(), trip))
+        if s.mud_ppg is not None and g.mud_ppg < need - 1e-9:
+            warnings.append(f"{s.name}: mud {g.mud_ppg:g} ppg is below pore pressure + trip margin "
+                            f"({need:.1f} ppg) in its hole section")
+    kts = []
+    for s in nested:
+        g = by_name[s.name]
+        if g.next_td_tvd_ft is None or s.kind == "conductor":
+            continue
+        required = _required_kick(well, s.name, [])
+        grad = _gas_gradient(well, s.name)
+        kt = kick_tolerance_ppg(g.shoe_tvd_ft, float(profiles.frac_ppg(g.shoe_tvd_ft)), g.next_td_tvd_ft,
+                                g.next_mud_ppg, influx_height_ft, grad)
+        kts.append(KickTolerance(s.name, g.shoe_tvd_ft, g.next_td_tvd_ft, g.next_mud_ppg, kt, required))
+        if kt < required - 1e-9:
+            warnings.append(f"{s.name}: kick tolerance {kt:.2f} ppg is below the required {required:.2f} ppg")
+    return SettingDepthResult(chosen, shoes, kts, warnings + notes)
+
+
+# --- Stresses for the triaxial check ------------------------------------------------------
+
+def lame_stresses_psi(p_internal_psi, p_external_psi, r_inner_in: float, r_outer_in: float, r_in):
+    """Lame radial and hoop stress at radius r in a thick cylinder (compression negative).
+
+    sigma_r = A - B/r^2, sigma_theta = A + B/r^2, with
+    A = (Pi ri^2 - Po ro^2) / (ro^2 - ri^2), B = (Pi - Po) ri^2 ro^2 / (ro^2 - ri^2).
+    """
+    pi, po = np.asarray(p_internal_psi, dtype=float), np.asarray(p_external_psi, dtype=float)
+    ri2, ro2 = r_inner_in**2, r_outer_in**2
+    a = (pi * ri2 - po * ro2) / (ro2 - ri2)
+    b = (pi - po) * ri2 * ro2 / (ro2 - ri2)
+    r2 = np.asarray(r_in, dtype=float) ** 2
+    return a - b / r2, a + b / r2
+
+
+def von_mises_psi(sigma_r, sigma_theta, sigma_z):
+    """Von Mises equivalent stress (spec 3.4)."""
+    return np.sqrt(0.5 * ((sigma_z - sigma_theta) ** 2 + (sigma_theta - sigma_r) ** 2 + (sigma_r - sigma_z) ** 2))
+
+
+def triaxial_vme_inner_psi(pipe: Pipe, p_internal_psi, p_external_psi, axial_lbf, bending_psi):
+    """Largest VME stress at the inner wall, with bending added and subtracted."""
+    ri, ro = pipe.id_in / 2.0, pipe.od_in / 2.0
+    s_r, s_t = lame_stresses_psi(p_internal_psi, p_external_psi, ri, ro, ri)
+    s_z = np.asarray(axial_lbf) / pipe.area_steel_in2
+    return np.maximum(von_mises_psi(s_r, s_t, s_z + bending_psi), von_mises_psi(s_r, s_t, s_z - bending_psi))
+
+
+# --- Design-factor check ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CheckRow:
+    string: str
+    case: str
+    check: str  # burst, collapse, tension, compression, triaxial
+    design_factor: float  # minimum over nodes; inf when the case puts no load of this kind
+    required: float
+    md_ft: float | None
+    tvd_ft: float | None
+
+    @property
+    def ok(self) -> bool:
+        return self.design_factor >= self.required - 1e-9
+
+
+@dataclass
+class StringCheck:
+    string: str
+    pipe: Pipe
+    rows: list[CheckRow]
+    loads: StringLoads
+    max_surface_treating_psi: float | None = None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return all(r.ok for r in self.rows)
+
+    def governing(self, check: str) -> CheckRow | None:
+        rows = [r for r in self.rows if r.check == check]
+        return min(rows, key=lambda r: r.design_factor / r.required) if rows else None
+
+
+YieldDerate = Callable[[np.ndarray], np.ndarray]
+
+
+def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
+                 pipe: Pipe, yield_derate: YieldDerate | None = None) -> StringCheck:
+    """Design factors for one string made of one pipe, for every case and check.
+
+    yield_derate(temperature_F) -> factor on Y_p from the manufacturer's
+    table. Without one, no temperature derating is applied and a note says so.
+    """
+    body = PipeBody(pipe.od_in, pipe.id_in, pipe.weight_lb_per_ft)
+    sl = string_loads(well, profiles, geometries, name, body)
+    df = well.design_factors
+    notes = list(sl.notes)
+    if yield_derate is None:
+        factor = np.ones_like(sl.tvd_ft)
+        notes.append(f"{name}: no temperature derating of yield (manufacturer table not supplied)")
+    else:
+        factor = np.asarray(yield_derate(sl.temperature_F), dtype=float)
+    yp = pipe.yield_psi * factor
+    if pipe.conn_tension_lbf is None:
+        notes.append(f"{name}: no connection ratings given; pipe body only")
+
+    burst_rating = rt.burst_api_psi(pipe.od_in, pipe.wall_in, yp)
+    if pipe.conn_internal_psi is not None:
+        burst_rating = np.minimum(burst_rating, pipe.conn_internal_psi)
+    body_yield = rt.pipe_body_yield_lbf(pipe.od_in, pipe.wall_in, yp)
+    tension_rating = body_yield if pipe.conn_tension_lbf is None else np.minimum(body_yield, pipe.conn_tension_lbf)
+    comp_rating = body_yield if pipe.conn_compression_lbf is None else np.minimum(body_yield, pipe.conn_compression_lbf)
+    bend_psi = sl.bending_stress_psi
+    bend_lbf = bend_psi * pipe.area_steel_in2
+    thin_wall = rt.collapse_regime(pipe.od_in, pipe.wall_in, pipe.yield_psi) != rt.YIELD
+
+    rows: list[CheckRow] = []
+
+    def row(case: str, check: str, rating, load, required: float) -> None:
+        rows.append(_min_df(name, case, check, np.asarray(rating, dtype=float),
+                            np.asarray(load, dtype=float), required, sl))
+
+    for c in sl.cases:
+        if c.mode == "burst":
+            row(c.name, "burst", burst_rating, c.load_psi, df.burst)
+        else:
+            sigma_a = c.axial_real_lbf / pipe.area_steel_in2
+            rating = rt.collapse_api_combined_psi(pipe.od_in, pipe.wall_in, yp, sigma_a)
+            pe_eq = rt.equivalent_external_pressure_psi(c.p_external_psi, c.p_internal_psi, pipe.od_in, pipe.wall_in)
+            row(c.name, "collapse", rating, pe_eq, df.collapse)
+        _axial_rows(row, c.name, c.axial_real_lbf, bend_lbf, tension_rating, comp_rating, df)
+        if c.mode == "collapse" and thin_wall:
+            continue  # spec 3.4: triaxial is not a collapse criterion for thin-wall pipe
+        vme = triaxial_vme_inner_psi(pipe, c.p_internal_psi, c.p_external_psi, c.axial_real_lbf, bend_psi)
+        row(c.name, "triaxial", yp, vme, df.triaxial)
+    for a in sl.axial:
+        _axial_rows(row, a.name, a.real_lbf, bend_lbf, tension_rating, comp_rating, df)
+    if thin_wall and any(c.mode == "collapse" for c in sl.cases):
+        notes.append(f"{name}: triaxial not applied to collapse cases (D/t {pipe.dt:.1f} is outside the "
+                     f"yield-collapse range; spec 3.4)")
+
+    ps_max = None
+    frac = next((c for c in sl.cases if c.name == "frac_down_casing"), None)
+    if frac is not None:
+        cfg = well.load_cases[name].frac_down_casing
+        ps = _base(cfg.max_surface_psi)
+        # Largest P_s with burst load <= rating / DF at every node (burst only; axial
+        # and triaxial also change with P_s through ballooning).
+        ps_max = float(np.min(burst_rating / df.burst - (frac.p_internal_psi - ps) + frac.p_external_psi))
+    return StringCheck(name, pipe, rows, sl, ps_max, notes)
+
+
+def _axial_rows(row, case: str, axial_lbf, bend_lbf, tension_rating, comp_rating, df) -> None:
+    row(case, "tension", tension_rating, axial_lbf + bend_lbf, df.tension)
+    row(case, "compression", comp_rating, -(axial_lbf - bend_lbf), df.compression)
+
+
+def _min_df(string: str, case: str, check: str, rating: np.ndarray, load: np.ndarray, required: float,
+            sl: StringLoads) -> CheckRow:
+    rating = np.broadcast_to(rating, load.shape)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dfs = np.where(load > 0, rating / np.where(load > 0, load, 1.0), np.inf)
+    i = int(np.argmin(dfs))
+    if not np.isfinite(dfs[i]):
+        return CheckRow(string, case, check, float("inf"), required, None, None)
+    return CheckRow(string, case, check, float(dfs[i]), required, float(sl.md_ft[i]), float(sl.tvd_ft[i]))
+
+
+def _gas_kick_settings(well: WellInput, name: str):
+    cfg = well.load_cases.get(name)
+    return cfg.gas_kick if cfg is not None and cfg.gas_kick not in (None, False) else None
+
+
+def _required_kick(well: WellInput, name: str, notes: list[str]) -> float:
+    gk = _gas_kick_settings(well, name)
+    if gk is not None and gk.kick_intensity_ppg is not None:
+        return _base(gk.kick_intensity_ppg)
+    notes.append(f"{name}: kick_intensity_ppg not given; shoe must tolerate "
+                 f"{PLACEHOLDER_KICK_INTENSITY_PPG} ppg (placeholder)")
+    return PLACEHOLDER_KICK_INTENSITY_PPG
+
+
+def _gas_gradient(well: WellInput, name: str) -> float:
+    gk = _gas_kick_settings(well, name)
+    return _base(gk.gas_gradient_psi_per_ft) if gk is not None and gk.gas_gradient_psi_per_ft is not None else 0.1
+
+
+def _base(x: float | Distribution) -> float:
+    return x.base if isinstance(x, Distribution) else float(x)
+

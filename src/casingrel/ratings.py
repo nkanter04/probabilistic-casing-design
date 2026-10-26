@@ -196,3 +196,58 @@ def _dt_and_yield(od_in: ArrayLike, wall_in: ArrayLike,
 def _scalar_or_array(x: np.ndarray) -> np.ndarray | float:
     x = np.asarray(x)
     return float(x) if x.ndim == 0 else x
+
+
+# --- Pipe specification ---------------------------------------------------------
+
+# Minimum yield strength by API 5CT grade, psi (API Spec 5CT / ISO 11960).
+GRADE_YIELD_PSI = {
+    "H40": 40_000.0, "J55": 55_000.0, "K55": 55_000.0, "M65": 65_000.0, "N80": 80_000.0,
+    "L80": 80_000.0, "C90": 90_000.0, "R95": 95_000.0, "T95": 95_000.0, "C110": 110_000.0,
+    "P110": 110_000.0, "Q125": 125_000.0,
+}
+
+
+@dataclass(frozen=True)
+class Pipe:
+    """One pipe: body dimensions, grade and optional connection ratings.
+
+    Connection ratings come from the manufacturer's data sheet. When one is
+    missing, only the pipe body is checked and the design check says so.
+    """
+
+    od_in: float
+    wall_in: float
+    weight_lb_per_ft: float
+    grade: str
+    yield_psi: float | None = None
+    drift_in: float | None = None
+    connection: str | None = None
+    conn_tension_lbf: float | None = None
+    conn_compression_lbf: float | None = None
+    conn_internal_psi: float | None = None
+    cost_per_ft: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.yield_psi is None:
+            if self.grade not in GRADE_YIELD_PSI:
+                raise ValueError(f"unknown grade {self.grade!r}; give yield_psi")
+            object.__setattr__(self, "yield_psi", GRADE_YIELD_PSI[self.grade])
+        if not 0 < self.wall_in < self.od_in / 2:
+            raise ValueError("wall_in must be positive and less than half the OD")
+
+    @property
+    def id_in(self) -> float:
+        return self.od_in - 2.0 * self.wall_in
+
+    @property
+    def dt(self) -> float:
+        return self.od_in / self.wall_in
+
+    @property
+    def area_steel_in2(self) -> float:
+        return np.pi / 4.0 * (self.od_in**2 - self.id_in**2)
+
+    @property
+    def label(self) -> str:
+        return f"{self.od_in:g}-in {self.weight_lb_per_ft:g} lb/ft {self.grade}"
