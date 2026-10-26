@@ -89,6 +89,16 @@ class Distribution(_Model):
             raise ValueError("mode must lie between low and high")
         return self
 
+    @property
+    def base(self) -> float:
+        """Value used in the deterministic run: mean (normal, lognormal),
+        midpoint (uniform) or mode (triangular)."""
+        if self.dist in ("normal", "lognormal"):
+            return self.mean
+        if self.dist == "uniform":
+            return 0.5 * (self.low + self.high)
+        return self.mode
+
     def in_field_unit(self, unit: str, scale: float = 1.0) -> Distribution:
         if self.unit is None:
             return self
@@ -196,6 +206,8 @@ class RatioCurve(_Curve):
 
 
 class PsiPerFtCurve(_Curve):
+    """Overburden as average gradient Sv/TVD (psi/ft) vs TVD, so Sv = gradient * TVD."""
+
     table: Annotated[dict[float, float], _table("psi/ft")]
 
 

@@ -7,7 +7,7 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, and the synthetic-well generator with three bundled test wells in [examples/](examples/).
+> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, and the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature).
 
 Regenerate the bundled synthetic wells with `python -m casingrel.synthetic`.
 
