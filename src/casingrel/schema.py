@@ -392,7 +392,7 @@ class CasingString(_Model):
     shoe_md_ft: ShoeDepth | None = None
     shoe_tvd_ft: ShoeDepth | None = None
     top_md_ft: Ft = 0.0
-    toc_ft: TocDepth
+    toc_ft: TocDepth  # measured depth, as read from a cement log
     mud_ppg: UPpg | None = None
 
     @model_validator(mode="before")
@@ -444,9 +444,14 @@ class Fluids(_Model):
 # A case left out gets the default for the string's kind in loads.py.
 
 class GasKick(_Model):
+    """Gas to surface from the next section's TD. kick_intensity_ppg is added
+    to the pore pressure there. With limit_to_shoe_frac, pressure at this
+    string's shoe is capped at the shoe's fracture pressure."""
+
     gas_gradient_psi_per_ft: UPsiPerFt | None = None
     kick_intensity_ppg: UPpg | None = None
     kick_volume_bbl: UBbl | None = None
+    limit_to_shoe_frac: bool = False
 
 
 class LostReturns(_Model):
@@ -459,8 +464,12 @@ class PressureTest(_Model):
 
 
 class FracDownCasing(_Model):
+    """Injection down casing; fluid_temp_F is the injected fluid temperature
+    (cooling adds tension). If omitted, the surface temperature is used."""
+
     max_surface_psi: UPsi
     fluid_ppg: UPpg
+    fluid_temp_F: UDegF | None = None
 
 
 class TubingLeak(_Model):
@@ -483,6 +492,13 @@ class Depletion(_Model):
     annulus_level_ft: UFt | None = None
 
 
+class Running(_Model):
+    """Axial load while running: buoyed weight plus the larger of overpull and shock."""
+
+    overpull_lbf: float | None = None
+    shock: bool = True
+
+
 def _switch(v: Any) -> Any:
     if v is True or v == "full":
         return {}
@@ -502,6 +518,7 @@ class StringLoadCases(_Model):
     evacuation: _case(Evacuation) = None
     cementing: _case(Cementing) = None
     depletion: _case(Depletion) = None
+    running: _case(Running) = None
 
 
 # --- Design rules and the rest -----------------------------------------------
