@@ -29,6 +29,7 @@ from .design import StringCheck, WellCheck  # noqa: E402
 from .loads import StringLoads  # noqa: E402
 from .optimize import Optimization  # noqa: E402
 from .reliability import SWEEP_TARGETS, ShoeMove, StringReliability  # noqa: E402
+from .sensitivity import StringSensitivity  # noqa: E402
 
 PF_FLOOR = 1e-12  # smaller Pf values are shown as "< 1e-12"
 BETA_CAP = 8.0
@@ -41,12 +42,14 @@ CHECKS = ("burst", "collapse", "tension", "compression", "triaxial")
 def write_report(result: WellCheck, out_dir: str | Path,
                  reliability: dict[str, StringReliability] | None = None,
                  shoe_moves: list[ShoeMove] | None = None,
-                 optimization: Optimization | None = None) -> Path:
+                 optimization: Optimization | None = None,
+                 sensitivity: dict[str, StringSensitivity] | None = None) -> Path:
     """Write the report, plots and CSV; returns report.md's path.
 
     With `reliability`, adds the probability-of-failure tables (spec output 3);
     with `optimization`, the optimized design, target sweep and reference
-    comparison (output 4).
+    comparison (output 4); with `sensitivity`, tornado, Sobol and Pf vs
+    treating pressure (output 5).
     """
     out = Path(out_dir)
     (out / "plots").mkdir(parents=True, exist_ok=True)
@@ -54,8 +57,12 @@ def write_report(result: WellCheck, out_dir: str | Path,
     for g in result.geometries:
         plot_string(result, g.name, out / "plots" / f"loads_{_slug(g.name)}.png")
     write_csv(result, out / "design_factors.csv")
+    for name, s in (sensitivity or {}).items():
+        plot_tornado(s, out / "plots" / f"tornado_{_slug(name)}.png")
+        if s.treating:
+            plot_treating(s, result.well.reliability_target_pf, out / "plots" / f"pf_vs_ps_{_slug(name)}.png")
     path = out / "report.md"
-    path.write_text(render_markdown(result, reliability, shoe_moves, optimization), encoding="utf-8",
+    path.write_text(render_markdown(result, reliability, shoe_moves, optimization, sensitivity), encoding="utf-8",
                     newline="\n")
     return path
 
@@ -63,7 +70,8 @@ def write_report(result: WellCheck, out_dir: str | Path,
 # --- Markdown ------------------------------------------------------------------------------
 
 def render_markdown(r: WellCheck, reliability: dict[str, StringReliability] | None = None,
-                    shoe_moves: list[ShoeMove] | None = None, optimization: Optimization | None = None) -> str:
+                    shoe_moves: list[ShoeMove] | None = None, optimization: Optimization | None = None,
+                    sensitivity: dict[str, StringSensitivity] | None = None) -> str:
     w = r.well
     lines = [f"# Casing design check: {w.well.name}", "", f"> {DISCLAIMER}", ""]
     if w.meta.synthetic:
@@ -77,6 +85,8 @@ def render_markdown(r: WellCheck, reliability: dict[str, StringReliability] | No
     lines += _depths(r, shoe_moves)
     if reliability:
         lines += _reliability(r, reliability)
+    if sensitivity:
+        lines += _sensitivity(r, sensitivity)
     lines += ["## Pressure window", "", "![Pressure window](plots/pressure_window.png)", "",
               "Pore pressure and fracture gradient set the mud window; each string's mud and shoe "
               "must sit inside it.", ""]
@@ -85,6 +95,8 @@ def render_markdown(r: WellCheck, reliability: dict[str, StringReliability] | No
     extra = []
     for rel in (reliability or {}).values():
         extra += rel.notes
+    for s in (sensitivity or {}).values():
+        extra += s.notes
     if optimization is not None:
         extra += optimization.notes
         for s in optimization.strings.values():
@@ -308,6 +320,96 @@ def _optimization(o: Optimization) -> list[str]:
         out += ["", "Each reference design is scored with the same loads, checks and reliability model as the "
                 "optimized design.", ""]
     return out
+
+
+def _sensitivity(r: WellCheck, sens: dict[str, StringSensitivity]) -> list[str]:
+    """Tornado, Sobol and Pf vs treating pressure for each string's governing limit state (spec 4.5)."""
+    out = ["## Sensitivity", "",
+           "Each string's governing failure mode from the table above, and which inputs drive it.", ""]
+    target = r.well.reliability_target_pf
+    for name, s in sens.items():
+        slug = _slug(name)
+        out += [f"### {name}: {s.check} under {s.case} (β {_fmt_beta(s.beta_base)})", "",
+                "| Input | P10 | P90 | β at P10 | β at P90 |", "|---|---|---|---|---|"]
+        out += [f"| {b.variable} | {b.p10:.4g} | {b.p90:.4g} | {_fmt_beta(b.beta_p10)} | {_fmt_beta(b.beta_p90)} |"
+                for b in s.tornado]
+        top = s.tornado[0] if s.tornado else None
+        far = top is not None and min(top.beta_p10, top.beta_p90) > BETA_CAP
+        if far:
+            out.append("")
+            out.append(f"This failure mode stays far from failure (β > {BETA_CAP:g}) wherever any single input is "
+                       "held, so no one input controls its Pf.")
+        elif top is not None:
+            out.append("")
+            out.append(f"Holding {top.variable} at its P10 gives β {_fmt_beta(top.beta_p10)}, and at its P90 "
+                       f"β {_fmt_beta(top.beta_p90)} (the other inputs stay random), so better data on "
+                       f"{top.variable} would change this string's Pf the most.")
+        out += ["", f"![{name} tornado](plots/tornado_{slug}.png)", "",
+                f"| Input | Sobol first-order | Sobol total |", "|---|---|---|"]
+        out += [f"| {x.variable} | {x.first:.3f} | {x.total:.3f} |" for x in s.sobol]
+        lead = s.sobol[0] if s.sobol and math.isfinite(s.sobol[0].total) else None
+        out.append("")
+        if lead is not None:
+            out.append(f"{lead.variable} explains about {max(lead.total, 0):.0%} of the variance in the safety "
+                       f"margin ({s.sobol_samples:,} base samples); indices near zero (small negative values are "
+                       "sampling noise) mark inputs that could be fixed at their base value.")
+        else:
+            out.append("The safety margin does not vary with the inputs, so there are no Sobol indices.")
+        if s.treating:
+            out += ["", "| Max surface treating pressure (psi) | Pf (frac case, FORM) | β |", "|---|---|---|"]
+            out += [f"| {t.surface_psi:,.0f} | {_fmt_pf(t.pf)} | {_fmt_beta(t.beta)} |" for t in s.treating]
+            out.append("")
+            if s.treating_limit_psi is not None:
+                out.append(f"This string meets Pf ≤ {target:g} under the frac load up to a surface treating pressure "
+                           f"of about {s.treating_limit_psi:,.0f} psi.")
+            elif all(t.pf <= target for t in s.treating):
+                out.append(f"This string meets Pf ≤ {target:g} under the frac load across the whole pressure range shown.")
+            else:
+                out.append(f"This string does not meet Pf ≤ {target:g} under the frac load anywhere in the range shown.")
+            out += ["", f"![{name} Pf vs treating pressure](plots/pf_vs_ps_{slug}.png)"]
+        out.append("")
+    return out
+
+
+def plot_tornado(s: StringSensitivity, path: Path) -> None:
+    """Horizontal bars of beta at each input's P10 and P90 around the base beta."""
+    bars = list(reversed(s.tornado))
+    cap = 2 * max(abs(s.beta_base), 1.0) + 5
+    clip = lambda b: max(min(b, cap), -cap)  # noqa: E731
+    fig, ax = plt.subplots(figsize=(7, 0.6 * len(bars) + 1.5))
+    for i, b in enumerate(bars):
+        lo, hi = clip(b.beta_p10), clip(b.beta_p90)
+        ax.barh(i, lo - s.beta_base, left=s.beta_base, color="C0", label="P10" if i == 0 else None)
+        ax.barh(i, hi - s.beta_base, left=s.beta_base, color="C3", alpha=0.7, label="P90" if i == 0 else None)
+    ax.axvline(s.beta_base, color="k", lw=1)
+    ax.set_yticks(range(len(bars)), [b.variable for b in bars], fontsize=8)
+    ax.set_xlabel("Reliability index β (input held at P10 / P90)")
+    ax.set_title(f"{s.string}: {s.check} under {s.case}", fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="x")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def plot_treating(s: StringSensitivity, target_pf: float, path: Path) -> None:
+    """Pf of the frac case against maximum surface treating pressure, log scale, with the target."""
+    ps = [t.surface_psi for t in s.treating]
+    pf = [max(t.pf, 1e-300) for t in s.treating]
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.semilogy(ps, pf, "o-", label="Pf (frac case)")
+    ax.axhline(target_pf, color="C3", ls="--", label=f"Target {target_pf:g}")
+    if s.treating_limit_psi is not None:
+        ax.axvline(s.treating_limit_psi, color="0.4", ls=":", label=f"Limit ≈ {s.treating_limit_psi:,.0f} psi")
+    ax.set_ylim(max(min(pf), 1e-30) / 10, 1.5)
+    ax.set_xlabel("Maximum surface treating pressure (psi)")
+    ax.set_ylabel("Probability of failure")
+    ax.set_title(s.string, fontsize=10)
+    ax.grid(alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
 
 
 def _fmt_pf(pf: float | None) -> str:

@@ -24,6 +24,7 @@ The full specification is [docs/spec.md](docs/spec.md). Read it before starting 
     design.py       setting depths, deterministic design factors
     reliability.py  distributions, Monte Carlo, FORM
     optimize.py     candidate strings, tapered search, cost
+    sensitivity.py  tornado, Sobol, Pf vs treating pressure (added 2026-10-27)
     report.py       tables, plots, assumptions list
     synthetic.py    synthetic-well generator
     cli.py          casingrel run well.yaml -> report

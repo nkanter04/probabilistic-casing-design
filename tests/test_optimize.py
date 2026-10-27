@@ -213,4 +213,7 @@ def test_cli_optimize_and_probabilistic(tmp_path, capsys):
     assert main(["run", str(WELL_C), "-o", str(tmp_path / "r"), "--probabilistic", *small]) == 0
     text = (tmp_path / "r" / "report.md").read_text(encoding="utf-8")
     assert "## Probability of failure" in text and "Share of samples where the shoe must move" in text
+    assert "## Sensitivity" in text and "Sobol total" in text
+    assert (tmp_path / "r" / "plots" / "tornado_intermediate.png").exists()
+    assert (tmp_path / "r" / "plots" / "pf_vs_ps_intermediate.png").exists()
     assert "max Pf" in capsys.readouterr().out
