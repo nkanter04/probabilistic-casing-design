@@ -247,6 +247,68 @@ class StringCheck:
 YieldDerate = Callable[[np.ndarray], np.ndarray]
 
 
+@dataclass(frozen=True)
+class Demand:
+    """Rating (capacity) and load for one case and check, at every node.
+
+    Shapes are (n_nodes,) in the deterministic run and (n, n_nodes) with
+    samples. The design factor is rating / load; the limit state is
+    g = rating - load (spec 4.1). Both come from this one function, so the
+    deterministic and probabilistic answers cannot disagree.
+    """
+
+    case: str
+    check: str
+    rating: np.ndarray
+    load: np.ndarray
+    required: float
+
+
+def demands(sl: StringLoads, pipe: Pipe, design_factors, yield_psi, od_in=None, wall_in=None) -> list[Demand]:
+    """Every (case, check) rating and load for one string and pipe.
+
+    yield_psi may carry temperature derating and sampled yield ratios; od_in
+    and wall_in may be sampled. Areas for axial stress and the Lame stresses
+    use the nominal pipe.
+    """
+    df = design_factors
+    od = pipe.od_in if od_in is None else od_in
+    wall = pipe.wall_in if wall_in is None else wall_in
+    yp = yield_psi
+    burst_rating = rt.burst_api_psi(od, wall, yp)
+    if pipe.conn_internal_psi is not None:
+        burst_rating = np.minimum(burst_rating, pipe.conn_internal_psi)
+    body_yield = rt.pipe_body_yield_lbf(od, wall, yp)
+    tension_rating = body_yield if pipe.conn_tension_lbf is None else np.minimum(body_yield, pipe.conn_tension_lbf)
+    comp_rating = body_yield if pipe.conn_compression_lbf is None else np.minimum(body_yield, pipe.conn_compression_lbf)
+    bend_psi = sl.bending_stress_psi
+    bend_lbf = bend_psi * pipe.area_steel_in2
+    thin_wall = rt.collapse_regime(pipe.od_in, pipe.wall_in, pipe.yield_psi) != rt.YIELD
+
+    out: list[Demand] = []
+
+    def axial(case: str, force) -> None:
+        out.append(Demand(case, "tension", tension_rating, force + bend_lbf, df.tension))
+        out.append(Demand(case, "compression", comp_rating, -(force - bend_lbf), df.compression))
+
+    for c in sl.cases:
+        if c.mode == "burst":
+            out.append(Demand(c.name, "burst", burst_rating, c.load_psi, df.burst))
+        else:
+            sigma_a = c.axial_real_lbf / pipe.area_steel_in2
+            rating = rt.collapse_api_combined_psi(od, wall, yp, sigma_a)
+            pe_eq = rt.equivalent_external_pressure_psi(c.p_external_psi, c.p_internal_psi, od, wall)
+            out.append(Demand(c.name, "collapse", rating, pe_eq, df.collapse))
+        axial(c.name, c.axial_real_lbf)
+        if c.mode == "collapse" and thin_wall:
+            continue  # spec 3.4: triaxial is not a collapse criterion for thin-wall pipe
+        vme = triaxial_vme_inner_psi(pipe, c.p_internal_psi, c.p_external_psi, c.axial_real_lbf, bend_psi)
+        out.append(Demand(c.name, "triaxial", yp, vme, df.triaxial))
+    for a in sl.axial:
+        axial(a.name, a.real_lbf)
+    return out
+
+
 def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
                  pipe: Pipe, yield_derate: YieldDerate | None = None) -> StringCheck:
     """Design factors for one string made of one pipe, for every case and check.
@@ -258,46 +320,13 @@ def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeo
     sl = string_loads(well, profiles, geometries, name, body)
     df = well.design_factors
     notes = list(sl.notes)
-    if yield_derate is None:
-        factor = np.ones_like(sl.tvd_ft)
-        notes.append(f"{name}: no temperature derating of yield (manufacturer table not supplied)")
-    else:
-        factor = np.asarray(yield_derate(sl.temperature_F), dtype=float)
-    yp = pipe.yield_psi * factor
+    yp = pipe.yield_psi * _derate_factor(sl, yield_derate, name, notes)
     if pipe.conn_tension_lbf is None:
         notes.append(f"{name}: no connection ratings given; pipe body only")
-
-    burst_rating = rt.burst_api_psi(pipe.od_in, pipe.wall_in, yp)
-    if pipe.conn_internal_psi is not None:
-        burst_rating = np.minimum(burst_rating, pipe.conn_internal_psi)
-    body_yield = rt.pipe_body_yield_lbf(pipe.od_in, pipe.wall_in, yp)
-    tension_rating = body_yield if pipe.conn_tension_lbf is None else np.minimum(body_yield, pipe.conn_tension_lbf)
-    comp_rating = body_yield if pipe.conn_compression_lbf is None else np.minimum(body_yield, pipe.conn_compression_lbf)
-    bend_psi = sl.bending_stress_psi
-    bend_lbf = bend_psi * pipe.area_steel_in2
+    dem = demands(sl, pipe, df, yp)
+    rows = [_min_df(name, d.case, d.check, np.asarray(d.rating, dtype=float), np.asarray(d.load, dtype=float),
+                    d.required, sl) for d in dem]
     thin_wall = rt.collapse_regime(pipe.od_in, pipe.wall_in, pipe.yield_psi) != rt.YIELD
-
-    rows: list[CheckRow] = []
-
-    def row(case: str, check: str, rating, load, required: float) -> None:
-        rows.append(_min_df(name, case, check, np.asarray(rating, dtype=float),
-                            np.asarray(load, dtype=float), required, sl))
-
-    for c in sl.cases:
-        if c.mode == "burst":
-            row(c.name, "burst", burst_rating, c.load_psi, df.burst)
-        else:
-            sigma_a = c.axial_real_lbf / pipe.area_steel_in2
-            rating = rt.collapse_api_combined_psi(pipe.od_in, pipe.wall_in, yp, sigma_a)
-            pe_eq = rt.equivalent_external_pressure_psi(c.p_external_psi, c.p_internal_psi, pipe.od_in, pipe.wall_in)
-            row(c.name, "collapse", rating, pe_eq, df.collapse)
-        _axial_rows(row, c.name, c.axial_real_lbf, bend_lbf, tension_rating, comp_rating, df)
-        if c.mode == "collapse" and thin_wall:
-            continue  # spec 3.4: triaxial is not a collapse criterion for thin-wall pipe
-        vme = triaxial_vme_inner_psi(pipe, c.p_internal_psi, c.p_external_psi, c.axial_real_lbf, bend_psi)
-        row(c.name, "triaxial", yp, vme, df.triaxial)
-    for a in sl.axial:
-        _axial_rows(row, a.name, a.real_lbf, bend_lbf, tension_rating, comp_rating, df)
     if thin_wall and any(c.mode == "collapse" for c in sl.cases):
         notes.append(f"{name}: triaxial not applied to collapse cases (D/t {pipe.dt:.1f} is outside the "
                      f"yield-collapse range; spec 3.4)")
@@ -307,10 +336,18 @@ def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeo
     if frac is not None:
         cfg = well.load_cases[name].frac_down_casing
         ps = _base(cfg.max_surface_psi)
+        burst = next(d for d in dem if d.case == "frac_down_casing" and d.check == "burst")
         # Largest P_s with burst load <= rating / DF at every node (burst only; axial
         # and triaxial also change with P_s through ballooning).
-        ps_max = float(np.min(burst_rating / df.burst - (frac.p_internal_psi - ps) + frac.p_external_psi))
+        ps_max = float(np.min(burst.rating / df.burst - (frac.p_internal_psi - ps) + frac.p_external_psi))
     return StringCheck(name, pipe, rows, sl, ps_max, notes)
+
+
+def _derate_factor(sl: StringLoads, yield_derate: YieldDerate | None, name: str, notes: list[str]) -> np.ndarray:
+    if yield_derate is None:
+        notes.append(f"{name}: no temperature derating of yield (manufacturer table not supplied)")
+        return np.ones_like(np.asarray(sl.temperature_F, dtype=float))
+    return np.asarray(yield_derate(sl.temperature_F), dtype=float)
 
 
 # --- Whole-well deterministic run ------------------------------------------------------
@@ -413,11 +450,6 @@ def check_well(well: WellInput, design: str | None = None, profiles: Profiles | 
         else:
             loads[g.name] = string_loads(well, profiles, geoms, g.name)
     return WellCheck(well, profiles, depths, geoms, design_name, checks, loads, notes)
-
-
-def _axial_rows(row, case: str, axial_lbf, bend_lbf, tension_rating, comp_rating, df) -> None:
-    row(case, "tension", tension_rating, axial_lbf + bend_lbf, df.tension)
-    row(case, "compression", comp_rating, -(axial_lbf - bend_lbf), df.compression)
 
 
 def _min_df(string: str, case: str, check: str, rating: np.ndarray, load: np.ndarray, required: float,

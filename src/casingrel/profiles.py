@@ -142,6 +142,41 @@ class Profiles:
         return t0 + g * np.asarray(tvd_ft, dtype=float) / 100.0
 
 
+@dataclass(frozen=True)
+class ProfileView:
+    """Profiles with fixed shift/scale modifiers, e.g. one batch of Monte Carlo
+    samples shaped (n, 1). Exposes the same methods loads.py uses on Profiles."""
+
+    base: Profiles
+    pore_shift_ppg: ArrayLike = 0.0
+    pore_scale: ArrayLike = 1.0
+    poisson_shift: ArrayLike = 0.0
+    poisson_scale: ArrayLike = 1.0
+    overburden_scale: ArrayLike = 1.0
+    surface_F: ArrayLike | None = None
+    gradient_F_per_100ft: ArrayLike | None = None
+
+    @property
+    def survey(self) -> Survey:
+        return self.base.survey
+
+    def pore_ppg(self, tvd_ft: ArrayLike) -> np.ndarray:
+        return self.base.pore_ppg(tvd_ft, self.pore_shift_ppg, self.pore_scale)
+
+    def pore_psi(self, tvd_ft: ArrayLike) -> np.ndarray:
+        return self.base.pore_psi(tvd_ft, self.pore_shift_ppg, self.pore_scale)
+
+    def frac_ppg(self, tvd_ft: ArrayLike) -> np.ndarray:
+        return self.base.frac_ppg(tvd_ft, self.pore_shift_ppg, self.pore_scale, self.poisson_shift,
+                                  self.poisson_scale, self.overburden_scale)
+
+    def frac_psi(self, tvd_ft: ArrayLike) -> np.ndarray:
+        return ppg_to_psi(self.frac_ppg(tvd_ft), tvd_ft)
+
+    def temperature_F(self, tvd_ft: ArrayLike) -> np.ndarray:
+        return self.base.temperature_F(tvd_ft, self.surface_F, self.gradient_F_per_100ft)
+
+
 def ppg_to_psi(ppg: ArrayLike, tvd_ft: ArrayLike) -> np.ndarray:
     """Hydrostatic pressure, P_psi = 0.052 * rho_ppg * TVD_ft (spec Section 3)."""
     return PSI_PER_FT_PER_PPG * np.asarray(ppg) * np.asarray(tvd_ft, dtype=float)

@@ -27,6 +27,9 @@ API_WALL_TOLERANCE = 0.875
 # Elastic-collapse constant, psi (46.95e6 = 2E / (1 - nu^2) with API's E and nu).
 ELASTIC_COLLAPSE_CONST_PSI = 46.95e6
 
+# Numerical guard for the biaxial collapse rating; see collapse_api_combined_psi.
+YPA_FLOOR_PSI = 20_000.0
+
 YIELD = "yield"
 PLASTIC = "plastic"
 TRANSITION = "transition"
@@ -159,8 +162,10 @@ def reduced_yield_biaxial_psi(yield_psi: ArrayLike,
     in the spec) or s_a + p_i (internal pressure). Needs the standard's text.
     """
     yp = np.asarray(yield_psi, dtype=float)
-    ratio = np.asarray(axial_stress_psi, dtype=float) / yp
-    return _scalar_or_array((np.sqrt(1.0 - 0.75 * ratio**2) - 0.5 * ratio) * yp)
+    # Outside -2/sqrt(3) <= s_a/Y_p <= 1 the formula has no meaning (axial yield in
+    # tension gives Y_pa = 0); clipping keeps sampled extremes finite.
+    ratio = np.clip(np.asarray(axial_stress_psi, dtype=float) / yp, -2.0 / np.sqrt(3.0), 1.0)
+    return _scalar_or_array((np.sqrt(np.maximum(1.0 - 0.75 * ratio**2, 0.0)) - 0.5 * ratio) * yp)
 
 
 def collapse_api_combined_psi(od_in: ArrayLike, wall_in: ArrayLike,
@@ -172,8 +177,12 @@ def collapse_api_combined_psi(od_in: ArrayLike, wall_in: ArrayLike,
     coefficients, the regime and the collapse rating. Compare the result with
     equivalent_external_pressure_psi, not with the raw external pressure.
     """
-    ypa = reduced_yield_biaxial_psi(yield_psi, axial_stress_psi)
-    return collapse_api_psi(od_in, wall_in, ypa)
+    ypa = np.asarray(reduced_yield_biaxial_psi(yield_psi, axial_stress_psi), dtype=float)
+    # Below YPA_FLOOR_PSI (under the API formulas' range) the rating is scaled
+    # linearly to zero at Y_pa = 0, so heavy tension never yields a NaN or a jump.
+    low = ypa < YPA_FLOOR_PSI
+    rating = collapse_api_psi(od_in, wall_in, np.where(low, YPA_FLOOR_PSI, ypa))
+    return _scalar_or_array(np.where(low, rating * ypa / YPA_FLOOR_PSI, rating))
 
 
 def equivalent_external_pressure_psi(p_external_psi: ArrayLike, p_internal_psi: ArrayLike,
