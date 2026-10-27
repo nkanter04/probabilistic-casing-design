@@ -20,7 +20,8 @@ from typing import Callable
 import numpy as np
 
 from . import ratings as rt
-from .loads import PipeBody, StringGeometry, StringLoads, required_mud_ppg, resolve_strings, string_loads
+from .loads import (PipeBody, StringGeometry, StringLoads, TaperedBody, required_mud_ppg, resolve_strings,
+                    section_index, string_loads)
 from .profiles import Profiles, build_profiles
 from .ratings import Pipe
 from .schema import Distribution, ReferenceDesign, WellInput
@@ -203,10 +204,86 @@ def von_mises_psi(sigma_r, sigma_theta, sigma_z):
 
 def triaxial_vme_inner_psi(pipe: Pipe, p_internal_psi, p_external_psi, axial_lbf, bending_psi):
     """Largest VME stress at the inner wall, with bending added and subtracted."""
-    ri, ro = pipe.id_in / 2.0, pipe.od_in / 2.0
+    return _vme_inner(pipe.od_in, pipe.id_in, pipe.area_steel_in2, p_internal_psi, p_external_psi,
+                      axial_lbf, bending_psi)
+
+
+def _vme_inner(od_in, id_in, area_steel_in2, p_internal_psi, p_external_psi, axial_lbf, bending_psi):
+    ri, ro = np.asarray(id_in) / 2.0, np.asarray(od_in) / 2.0
     s_r, s_t = lame_stresses_psi(p_internal_psi, p_external_psi, ri, ro, ri)
-    s_z = np.asarray(axial_lbf) / pipe.area_steel_in2
+    s_z = np.asarray(axial_lbf) / area_steel_in2
     return np.maximum(von_mises_psi(s_r, s_t, s_z + bending_psi), von_mises_psi(s_r, s_t, s_z - bending_psi))
+
+
+# --- String designs (one pipe, or a tapered string) ----------------------------------------
+
+@dataclass(frozen=True)
+class StringDesign:
+    """Pipes for one string, top section first. crossovers_md_ft[i] is the
+    bottom of section i; a single pipe has no crossovers."""
+
+    pipes: tuple[Pipe, ...]
+    crossovers_md_ft: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.crossovers_md_ft) != len(self.pipes) - 1:
+            raise ValueError("a string design needs one crossover depth between each pair of pipes")
+
+    @classmethod
+    def of(cls, x: Pipe | StringDesign) -> StringDesign:
+        return x if isinstance(x, StringDesign) else cls((x,))
+
+    @property
+    def tapered(self) -> bool:
+        return len(self.pipes) > 1
+
+    @property
+    def label(self) -> str:
+        if not self.tapered:
+            return self.pipes[0].label
+        parts = [f"{p.label} to {x:,.0f} ft" for p, x in zip(self.pipes, self.crossovers_md_ft)]
+        return " / ".join(parts + [f"{self.pipes[-1].label} below"])
+
+    def body(self) -> PipeBody | TaperedBody:
+        bodies = tuple(PipeBody(p.od_in, p.id_in, p.weight_lb_per_ft) for p in self.pipes)
+        return bodies[0] if not self.tapered else TaperedBody(bodies, self.crossovers_md_ft)
+
+    def section_lengths_ft(self, top_md_ft: float, shoe_md_ft: float) -> list[float]:
+        edges = [top_md_ft, *self.crossovers_md_ft, shoe_md_ft]
+        return [b - a for a, b in zip(edges, edges[1:])]
+
+    def at(self, md_ft: np.ndarray) -> NodeRatings:
+        i = section_index(md_ft, self.crossovers_md_ft)
+
+        def pick(attr: str) -> np.ndarray:
+            vals = [getattr(p, attr) for p in self.pipes]
+            return np.array([np.nan if v is None else v for v in vals], dtype=float)[i]
+
+        regime_yield = np.array([rt.collapse_regime(p.od_in, p.wall_in, p.yield_psi) == rt.YIELD
+                                 for p in self.pipes])[i]
+        return NodeRatings(pick("od_in"), pick("wall_in"), pick("yield_psi"), pick("conn_internal_psi"),
+                           pick("conn_tension_lbf"), pick("conn_compression_lbf"), ~regime_yield)
+
+
+@dataclass(frozen=True)
+class NodeRatings:
+    """Nominal pipe properties at every node; missing connection ratings are NaN."""
+
+    od_in: np.ndarray
+    wall_in: np.ndarray
+    yield_psi: np.ndarray
+    conn_internal_psi: np.ndarray
+    conn_tension_lbf: np.ndarray
+    conn_compression_lbf: np.ndarray
+    thin_wall: np.ndarray  # True where D/t is outside the yield-collapse range
+
+    @property
+    def id_in(self) -> np.ndarray:
+        return self.od_in - 2.0 * self.wall_in
+
+    @property
+    def area_steel_in2(self) -> np.ndarray:
+        return np.pi / 4.0 * (self.od_in**2 - self.id_in**2)
 
 
 # --- Design-factor check ----------------------------------------------------------------------
@@ -229,7 +306,7 @@ class CheckRow:
 @dataclass
 class StringCheck:
     string: str
-    pipe: Pipe
+    design: StringDesign
     rows: list[CheckRow]
     loads: StringLoads
     max_surface_treating_psi: float | None = None
@@ -264,26 +341,26 @@ class Demand:
     required: float
 
 
-def demands(sl: StringLoads, pipe: Pipe, design_factors, yield_psi, od_in=None, wall_in=None) -> list[Demand]:
-    """Every (case, check) rating and load for one string and pipe.
+def demands(sl: StringLoads, design: Pipe | StringDesign, design_factors, yield_factor=1.0, yield_ratio=1.0,
+            od_ratio=1.0, wall_ratio=1.0) -> list[Demand]:
+    """Every (case, check) rating and load for one string and its pipe(s).
 
-    yield_psi may carry temperature derating and sampled yield ratios; od_in
-    and wall_in may be sampled. Areas for axial stress and the Lame stresses
-    use the nominal pipe.
+    yield_factor is temperature derating; the *_ratio arguments are sampled
+    manufacturing ratios (1 for the deterministic run). Areas for axial stress
+    and the Lame stresses use the nominal pipe.
     """
     df = design_factors
-    od = pipe.od_in if od_in is None else od_in
-    wall = pipe.wall_in if wall_in is None else wall_in
-    yp = yield_psi
-    burst_rating = rt.burst_api_psi(od, wall, yp)
-    if pipe.conn_internal_psi is not None:
-        burst_rating = np.minimum(burst_rating, pipe.conn_internal_psi)
+    n = StringDesign.of(design).at(sl.md_ft)
+    yp = n.yield_psi * yield_ratio * yield_factor
+    od = n.od_in * od_ratio
+    wall = n.wall_in * wall_ratio
+    burst_rating = np.fmin(rt.burst_api_psi(od, wall, yp), n.conn_internal_psi)
     body_yield = rt.pipe_body_yield_lbf(od, wall, yp)
-    tension_rating = body_yield if pipe.conn_tension_lbf is None else np.minimum(body_yield, pipe.conn_tension_lbf)
-    comp_rating = body_yield if pipe.conn_compression_lbf is None else np.minimum(body_yield, pipe.conn_compression_lbf)
+    tension_rating = np.fmin(body_yield, n.conn_tension_lbf)
+    comp_rating = np.fmin(body_yield, n.conn_compression_lbf)
+    a_s = n.area_steel_in2
     bend_psi = sl.bending_stress_psi
-    bend_lbf = bend_psi * pipe.area_steel_in2
-    thin_wall = rt.collapse_regime(pipe.od_in, pipe.wall_in, pipe.yield_psi) != rt.YIELD
+    bend_lbf = bend_psi * a_s
 
     out: list[Demand] = []
 
@@ -295,14 +372,15 @@ def demands(sl: StringLoads, pipe: Pipe, design_factors, yield_psi, od_in=None, 
         if c.mode == "burst":
             out.append(Demand(c.name, "burst", burst_rating, c.load_psi, df.burst))
         else:
-            sigma_a = c.axial_real_lbf / pipe.area_steel_in2
-            rating = rt.collapse_api_combined_psi(od, wall, yp, sigma_a)
+            rating = rt.collapse_api_combined_psi(od, wall, yp, c.axial_real_lbf / a_s)
             pe_eq = rt.equivalent_external_pressure_psi(c.p_external_psi, c.p_internal_psi, od, wall)
             out.append(Demand(c.name, "collapse", rating, pe_eq, df.collapse))
         axial(c.name, c.axial_real_lbf)
-        if c.mode == "collapse" and thin_wall:
+        if c.mode == "collapse" and n.thin_wall.all():
             continue  # spec 3.4: triaxial is not a collapse criterion for thin-wall pipe
-        vme = triaxial_vme_inner_psi(pipe, c.p_internal_psi, c.p_external_psi, c.axial_real_lbf, bend_psi)
+        vme = _vme_inner(n.od_in, n.id_in, a_s, c.p_internal_psi, c.p_external_psi, c.axial_real_lbf, bend_psi)
+        if c.mode == "collapse":
+            vme = np.where(n.thin_wall, 0.0, vme)
         out.append(Demand(c.name, "triaxial", yp, vme, df.triaxial))
     for a in sl.axial:
         axial(a.name, a.real_lbf)
@@ -310,26 +388,26 @@ def demands(sl: StringLoads, pipe: Pipe, design_factors, yield_psi, od_in=None, 
 
 
 def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
-                 pipe: Pipe, yield_derate: YieldDerate | None = None) -> StringCheck:
-    """Design factors for one string made of one pipe, for every case and check.
+                 pipe: Pipe | StringDesign, yield_derate: YieldDerate | None = None) -> StringCheck:
+    """Design factors for one string (one pipe or a tapered design), for every case and check.
 
     yield_derate(temperature_F) -> factor on Y_p from the manufacturer's
     table. Without one, no temperature derating is applied and a note says so.
     """
-    body = PipeBody(pipe.od_in, pipe.id_in, pipe.weight_lb_per_ft)
-    sl = string_loads(well, profiles, geometries, name, body)
+    design = StringDesign.of(pipe)
+    sl = string_loads(well, profiles, geometries, name, design.body())
     df = well.design_factors
     notes = list(sl.notes)
-    yp = pipe.yield_psi * _derate_factor(sl, yield_derate, name, notes)
-    if pipe.conn_tension_lbf is None:
+    factor = _derate_factor(sl, yield_derate, name, notes)
+    if any(p.conn_tension_lbf is None for p in design.pipes):
         notes.append(f"{name}: no connection ratings given; pipe body only")
-    dem = demands(sl, pipe, df, yp)
+    dem = demands(sl, design, df, factor)
     rows = [_min_df(name, d.case, d.check, np.asarray(d.rating, dtype=float), np.asarray(d.load, dtype=float),
                     d.required, sl) for d in dem]
-    thin_wall = rt.collapse_regime(pipe.od_in, pipe.wall_in, pipe.yield_psi) != rt.YIELD
-    if thin_wall and any(c.mode == "collapse" for c in sl.cases):
-        notes.append(f"{name}: triaxial not applied to collapse cases (D/t {pipe.dt:.1f} is outside the "
-                     f"yield-collapse range; spec 3.4)")
+    thin = [p for p in design.pipes if rt.collapse_regime(p.od_in, p.wall_in, p.yield_psi) != rt.YIELD]
+    if thin and any(c.mode == "collapse" for c in sl.cases):
+        notes.append(f"{name}: triaxial not applied to collapse cases where D/t is outside the yield-collapse "
+                     f"range (D/t {', '.join(f'{p.dt:.1f}' for p in thin)}; spec 3.4)")
 
     ps_max = None
     frac = next((c for c in sl.cases if c.name == "frac_down_casing"), None)
@@ -340,7 +418,7 @@ def check_string(well: WellInput, profiles: Profiles, geometries: list[StringGeo
         # Largest P_s with burst load <= rating / DF at every node (burst only; axial
         # and triaxial also change with P_s through ballooning).
         ps_max = float(np.min(burst.rating / df.burst - (frac.p_internal_psi - ps) + frac.p_external_psi))
-    return StringCheck(name, pipe, rows, sl, ps_max, notes)
+    return StringCheck(name, design, rows, sl, ps_max, notes)
 
 
 def _derate_factor(sl: StringLoads, yield_derate: YieldDerate | None, name: str, notes: list[str]) -> np.ndarray:
@@ -374,33 +452,48 @@ class WellCheck:
         return all(c.ok for c in self.checks.values())
 
 
-def design_pipes(well: WellInput, design: str | None = None) -> tuple[str | None, dict[str, Pipe], list[str]]:
-    """Pipes for each string from a reference design in the input (the first one by default)."""
+def design_pipes(well: WellInput, design: str | None = None
+                 ) -> tuple[str | None, dict[str, StringDesign], list[str]]:
+    """String designs from a reference design in the input (the first one by default).
+
+    A string with several sections is a tapered design: list the sections top
+    first and give bottom_md_ft for every section except the last.
+    """
     if not well.reference_designs:
         return None, {}, ["no reference design in the input; loads are reported without pipe checks"]
     ref = _pick_design(well.reference_designs, design)
     notes: list[str] = []
-    pipes: dict[str, Pipe] = {}
+    out: dict[str, StringDesign] = {}
     od_by_name = {s.name: s.od_in for s in well.strings}
     for name, sections in ref.strings.items():
-        if len(sections) != 1:
-            notes.append(f"{name}: tapered strings ({len(sections)} sections) are not checked yet")
-            continue
-        sec = sections[0]
-        od = sec.od_in if sec.od_in is not None else od_by_name[name]
-        if abs(od - od_by_name[name]) > 1e-6:
-            notes.append(f"{name}: design OD {od:g} in differs from the string's {od_by_name[name]:g} in")
-        if sec.wall_in is None:
-            notes.append(f"{name}: reference design gives no wall_in; string not checked")
-            continue
-        try:
-            pipes[name] = Pipe(od, sec.wall_in, sec.weight_lb_per_ft, sec.grade, yield_psi=sec.yield_psi,
-                               drift_in=sec.drift_in, connection=sec.connection,
-                               conn_tension_lbf=sec.conn_tension_lbf, conn_compression_lbf=sec.conn_compression_lbf,
-                               conn_internal_psi=sec.conn_internal_psi)
-        except ValueError as exc:
-            notes.append(f"{name}: {exc}; string not checked")
-    return ref.name, pipes, notes
+        pipes = []
+        for sec in sections:
+            od = sec.od_in if sec.od_in is not None else od_by_name[name]
+            if abs(od - od_by_name[name]) > 1e-6:
+                notes.append(f"{name}: design OD {od:g} in differs from the string's {od_by_name[name]:g} in")
+            if sec.wall_in is None:
+                notes.append(f"{name}: reference design gives no wall_in; string not checked")
+                break
+            try:
+                pipes.append(Pipe(od, sec.wall_in, sec.weight_lb_per_ft, sec.grade, yield_psi=sec.yield_psi,
+                                  drift_in=sec.drift_in, connection=sec.connection,
+                                  conn_tension_lbf=sec.conn_tension_lbf,
+                                  conn_compression_lbf=sec.conn_compression_lbf,
+                                  conn_internal_psi=sec.conn_internal_psi))
+            except ValueError as exc:
+                notes.append(f"{name}: {exc}; string not checked")
+                break
+        else:
+            crossovers = [sec.bottom_md_ft for sec in sections[:-1]]
+            if any(x is None for x in crossovers):
+                notes.append(f"{name}: tapered design needs bottom_md_ft on every section but the last; "
+                             "string not checked")
+                continue
+            try:
+                out[name] = StringDesign(tuple(pipes), tuple(crossovers))
+            except ValueError as exc:
+                notes.append(f"{name}: {exc}; string not checked")
+    return ref.name, out, notes
 
 
 def _pick_design(designs: list[ReferenceDesign], name: str | None) -> ReferenceDesign:
@@ -412,34 +505,47 @@ def _pick_design(designs: list[ReferenceDesign], name: str | None) -> ReferenceD
     raise ValueError(f"no reference design named {name!r}; have {[d.name for d in designs]}")
 
 
-def drift_notes(well: WellInput, geometries: list[StringGeometry], pipes: dict[str, Pipe]) -> list[str]:
+def next_bit_in(well: WellInput, g: StringGeometry) -> float | None:
+    """Bit size of the hole section drilled through this string, if any."""
+    if g.kind in ("liner", "tieback"):
+        return None
+    deeper = [s for s in well.strings if s.kind != "tieback" and s.od_in < g.od_in and s.hole_in < g.od_in]
+    return deeper[0].hole_in if deeper else None
+
+
+def drift_notes(well: WellInput, geometries: list[StringGeometry], designs: dict[str, StringDesign]) -> list[str]:
     """Flag pipes whose drift does not pass the next hole section's bit."""
     out = []
     for g in geometries:
-        pipe = pipes.get(g.name)
-        if pipe is None or g.kind in ("liner", "tieback"):
+        design = designs.get(g.name)
+        bit_in = next_bit_in(well, g)
+        if design is None or bit_in is None:
             continue
-        deeper = [s for s in well.strings if s.kind != "tieback" and s.od_in < g.od_in
-                  and s.hole_in < g.od_in]
-        if not deeper:
-            continue
-        bit_in = deeper[0].hole_in
-        if pipe.drift_in is None:
-            out.append(f"{g.name}: no drift_in given; cannot confirm the {bit_in:g}-in bit passes "
-                       f"(ID {pipe.id_in:.3f} in)")
-        elif pipe.drift_in < bit_in - 1e-9:
-            out.append(f"{g.name}: drift {pipe.drift_in:.3f} in is smaller than the next bit "
-                       f"({bit_in:g} in); a special-drift pipe or a smaller bit is needed")
+        for pipe in design.pipes:
+            if pipe.drift_in is None:
+                out.append(f"{g.name}: no drift_in given for {pipe.label}; cannot confirm the {bit_in:g}-in bit "
+                           f"passes (ID {pipe.id_in:.3f} in)")
+            elif pipe.drift_in < bit_in - 1e-9:
+                out.append(f"{g.name}: drift {pipe.drift_in:.3f} in is smaller than the next bit "
+                           f"({bit_in:g} in); a special-drift pipe or a smaller bit is needed")
     return out
 
 
 def check_well(well: WellInput, design: str | None = None, profiles: Profiles | None = None,
-               yield_derate: YieldDerate | None = None) -> WellCheck:
-    """Run the deterministic pipeline: profiles, setting depths, loads and design factors."""
+               yield_derate: YieldDerate | None = None, designs: dict[str, StringDesign] | None = None,
+               design_name: str | None = None) -> WellCheck:
+    """Run the deterministic pipeline: profiles, setting depths, loads and design factors.
+
+    The pipes come from `designs` when given (e.g. the optimizer's choice),
+    otherwise from the input's reference design named `design` (or the first).
+    """
     profiles = build_profiles(well) if profiles is None else profiles
     depths = setting_depths(well, profiles)
     geoms, _ = resolve_strings(well, profiles.survey, profiles, depths.chosen_tvd_ft)
-    design_name, pipes, notes = design_pipes(well, design)
+    if designs is None:
+        design_name, pipes, notes = design_pipes(well, design)
+    else:
+        pipes, notes = dict(designs), []
     notes += drift_notes(well, geoms, pipes)
     checks: dict[str, StringCheck] = {}
     loads: dict[str, StringLoads] = {}

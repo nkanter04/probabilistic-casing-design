@@ -7,7 +7,7 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, the deterministic report, and probability of failure by Monte Carlo and FORM (`casingrel.reliability`).
+> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, the deterministic report, probability of failure by Monte Carlo and FORM, and least-cost string selection from a pipe catalog (single and tapered strings).
 
 ## Usage
 
@@ -15,7 +15,15 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 casingrel run examples/synthetic_c_horizontal_frac.yaml -o reports/well_c
 ```
 
-This writes `report.md` (summary, setting depths and kick tolerance, design-factor tables, assumptions list), `plots/` and `design_factors.csv`. `casingrel synthetic` regenerates the bundled synthetic wells.
+This writes `report.md` (summary, setting depths and kick tolerance, design-factor tables, assumptions list), `plots/` and `design_factors.csv`. Add `--probabilistic` for probability of failure.
+
+```bash
+casingrel optimize examples/synthetic_c_horizontal_frac.yaml -o reports/well_c_opt
+```
+
+This chooses the cheapest design per string from the pipe catalog (`catalogs/api_starter.csv` unless the input names one) that passes the design factors and the reliability target. It also compares the choice with any reference designs. `casingrel synthetic` regenerates the bundled synthetic wells.
+
+The starter catalog holds only the six pipes from the spec's Section 6.1 table. Real designs need manufacturer data sheets (dimensions, drift, connection ratings, and prices if available).
 
 ## Development
 

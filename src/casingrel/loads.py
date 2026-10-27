@@ -41,6 +41,7 @@ STEEL_DENSITY_PPG = 65.5  # buoyancy factor 1 - rho/65.5 (spec 3.5)
 BENDING_PSI_PER_IN_PER_DEG_100FT = 218.0  # sigma_b = 218 D DLS (spec 3.5; E D kappa / 2 with E = 30e6 psi)
 THERMAL_LBF_PER_IN2_PER_F = 207.0  # E * alpha = 30e6 psi * 6.9e-6 /F (spec 3.5)
 BALLOONING_2NU = 0.6  # 2 * Poisson's ratio of steel, nu = 0.3 (Lubinski et al. 1962)
+STEEL_E_PSI = 30.0e6  # Young's modulus of steel (consistent with the 218 and 207 constants)
 
 # Placeholders, used only when the input gives no value. Each use is noted.
 PLACEHOLDER_GAS_GRADIENT_PSI_PER_FT = 0.10  # spec 2.2: 0.08-0.12 psi/ft placeholder
@@ -97,6 +98,71 @@ class PipeBody:
     @property
     def area_steel_in2(self) -> float:
         return self.area_outer_in2 - self.area_inner_in2
+
+    @property
+    def breaks(self) -> tuple[float, ...]:
+        """Extra node depths a layout needs (none for a single section)."""
+        return ()
+
+    def at(self, md_ft: np.ndarray) -> NodePipe:
+        n = np.ones_like(np.asarray(md_ft, dtype=float))
+        return NodePipe(self.od_in * n, self.id_in * n, self.weight_lb_per_ft * n)
+
+
+# A crossover is represented by two nodes: one at the crossover depth (upper
+# section) and one CROSSOVER_GAP_FT below it (lower section), so both pipes are
+# checked there.
+CROSSOVER_GAP_FT = 0.01
+
+
+def section_index(md_ft: ArrayLike, crossovers_md_ft: tuple[float, ...]) -> np.ndarray:
+    """Section of each node, 0 = top; a node exactly at a crossover belongs to the upper section."""
+    return np.searchsorted(np.asarray(crossovers_md_ft, dtype=float), np.asarray(md_ft, dtype=float), side="left")
+
+
+@dataclass(frozen=True)
+class NodePipe:
+    """Pipe-body dimensions at every node (arrays shaped like the node grid)."""
+
+    od_in: np.ndarray
+    id_in: np.ndarray
+    weight_lb_per_ft: np.ndarray
+
+    @property
+    def area_outer_in2(self) -> np.ndarray:
+        return np.pi / 4.0 * self.od_in**2
+
+    @property
+    def area_inner_in2(self) -> np.ndarray:
+        return np.pi / 4.0 * self.id_in**2
+
+    @property
+    def area_steel_in2(self) -> np.ndarray:
+        return self.area_outer_in2 - self.area_inner_in2
+
+
+@dataclass(frozen=True)
+class TaperedBody:
+    """A string of several pipe bodies, top section first. crossovers_md_ft[i]
+    is the bottom of section i (one fewer crossover than sections)."""
+
+    bodies: tuple[PipeBody, ...]
+    crossovers_md_ft: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.crossovers_md_ft) != len(self.bodies) - 1:
+            raise ValueError("a tapered string needs one crossover depth between each pair of sections")
+        if list(self.crossovers_md_ft) != sorted(self.crossovers_md_ft):
+            raise ValueError("crossover depths must increase downwards")
+
+    @property
+    def breaks(self) -> tuple[float, ...]:
+        return tuple(x for c in self.crossovers_md_ft for x in (c, c + CROSSOVER_GAP_FT))
+
+    def at(self, md_ft: np.ndarray) -> NodePipe:
+        i = section_index(md_ft, self.crossovers_md_ft)
+        pick = lambda attr: np.array([getattr(b, attr) for b in self.bodies])[i]  # noqa: E731
+        return NodePipe(pick("od_in"), pick("id_in"), pick("weight_lb_per_ft"))
 
 
 @dataclass(frozen=True)
@@ -188,10 +254,14 @@ def _resolve_shoe(s: CasingString, survey: Survey, chosen: dict[str, float]) -> 
     return survey.md_at_tvd(float(value)), float(value)
 
 
-def node_md(geom: StringGeometry, survey: Survey, step_ft: float = NODE_STEP_FT) -> np.ndarray:
+def node_md(geom: StringGeometry, survey: Survey, step_ft: float = NODE_STEP_FT,
+            extra_md_ft: ArrayLike = ()) -> np.ndarray:
     """MD nodes along a string: a regular grid plus the top, shoe, TOC, the
-    outer shoe and every survey station inside the string."""
-    md = [np.arange(geom.top_md_ft, geom.shoe_md_ft, step_ft), [geom.shoe_md_ft, geom.toc_md_ft]]
+    outer shoe, every survey station inside the string and any extra depths
+    (crossovers)."""
+    extra = np.asarray(extra_md_ft, dtype=float)
+    extra = extra[(extra > geom.top_md_ft) & (extra < geom.shoe_md_ft)]
+    md = [np.arange(geom.top_md_ft, geom.shoe_md_ft, step_ft), [geom.shoe_md_ft, geom.toc_md_ft], extra]
     md.append(survey.md_ft[(survey.md_ft > geom.top_md_ft) & (survey.md_ft < geom.shoe_md_ft)])
     if geom.outer_shoe_tvd_ft is not None and geom.top_tvd_ft < geom.outer_shoe_tvd_ft < geom.shoe_tvd_ft:
         md.append([survey.md_at_tvd(geom.outer_shoe_tvd_ft)])
@@ -289,9 +359,9 @@ def real_axial_lbf(effective_lbf: ArrayLike, p_internal_psi: ArrayLike, p_extern
             - np.asarray(p_external_psi) * pipe.area_outer_in2)
 
 
-def bending_stress_psi(od_in: float, dls_deg_per_100ft: ArrayLike) -> np.ndarray:
+def bending_stress_psi(od_in: ArrayLike, dls_deg_per_100ft: ArrayLike) -> np.ndarray:
     """Bending stress at the outer fibre, sigma_b = 218 D DLS (spec 3.5)."""
-    return BENDING_PSI_PER_IN_PER_DEG_100FT * od_in * np.asarray(dls_deg_per_100ft)
+    return BENDING_PSI_PER_IN_PER_DEG_100FT * np.asarray(od_in) * np.asarray(dls_deg_per_100ft)
 
 
 def thermal_force_lbf(area_steel_in2: float, delta_t_F: ArrayLike) -> np.ndarray:
@@ -394,7 +464,8 @@ PROFILE_KEYS = ("pore.shift_ppg", "pore.scale", "poisson.shift", "poisson.scale"
 
 
 def string_loads(well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
-                 pipe: PipeBody | None = None, realization: Realization | None = None) -> StringLoads:
+                 pipe: PipeBody | TaperedBody | None = None,
+                 realization: Realization | None = None) -> StringLoads:
     """All load cases for one string. With a pipe, also the axial loads.
 
     Without a realization every input is at its base value and each profile is
@@ -405,7 +476,7 @@ def string_loads(well: WellInput, profiles: Profiles, geometries: list[StringGeo
     real = realization or Realization()
     prof = real.profile_view(profiles) if realization is not None else profiles
     survey = profiles.survey
-    md = node_md(g, survey)
+    md = node_md(g, survey, extra_md_ft=pipe.breaks if pipe is not None else ())
     pts = survey.at_md(md)
     tvd = pts.tvd_ft
     notes: list[str] = []
@@ -510,12 +581,13 @@ def string_loads(well: WellInput, profiles: Profiles, geometries: list[StringGeo
                        float(profiles.temperature_F(0.0)), value, notes)
 
 
-def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, mud, surface_F, surface_F_base: float,
-                value, notes: list[str]) -> StringLoads:
-    """Add installation, running and service axial loads for one pipe."""
+def _with_axial(loads: StringLoads, settings: dict, layout: PipeBody | TaperedBody, mud, surface_F,
+                surface_F_base: float, value, notes: list[str]) -> StringLoads:
+    """Add installation, running and service axial loads for one pipe layout."""
     g, md, tvd = loads.geometry, loads.md_ft, loads.tvd_ft
+    pipe = layout.at(md)
     p_ref = hydrostatic_psi(mud, tvd)  # inside and outside when the cement sets
-    eff0 = effective_tension_lbf(tvd, g.shoe_tvd_ft, pipe.weight_lb_per_ft, mud)
+    eff0 = hanging_effective_tension_lbf(tvd, pipe.weight_lb_per_ft, mud)
     real0 = real_axial_lbf(eff0, p_ref, p_ref, pipe)
     axial = [AxialCase("installation", md, tvd, real0, eff0)]
 
@@ -525,7 +597,7 @@ def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, mud, surface
         if overpull is None:
             overpull = PLACEHOLDER_OVERPULL_LBF
             notes.append(f"{g.name}: running.overpull_lbf not given; used {overpull:,.0f} lbf (placeholder)")
-        extra = max(overpull, shock_load_lbf(pipe.weight_lb_per_ft) if run.shock else 0.0)
+        extra = np.maximum(overpull, shock_load_lbf(pipe.weight_lb_per_ft) if run.shock else 0.0)
         axial.append(AxialCase("running", md, tvd, real0 + extra, eff0 + extra))
 
     # Service changes act on the free pipe between the top and TOC, held at both ends.
@@ -534,16 +606,15 @@ def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, mud, surface
     for c in loads.cases:
         d_force = 0.0
         if free.sum() >= 2:
-            d_force = ballooning_force_lbf(_avg(md, c.p_internal_psi - p_ref, free),
-                                           _avg(md, c.p_external_psi - p_ref, free), pipe)
+            d_t = 0.0
             if c.name == "frac_down_casing":
                 cfg = settings["frac_down_casing"]
                 t_inj = value(f"load_cases.{g.name}.frac_down_casing.fluid_temp_F", cfg.fluid_temp_F, surface_F)
                 if cfg.fluid_temp_F is None:
                     notes.append(f"{g.name}: frac fluid temperature not given; used surface temperature "
                                  f"{surface_F_base:.0f} F (placeholder, maximum cooling)")
-                d_force = d_force + thermal_force_lbf(pipe.area_steel_in2,
-                                                      _avg(md, t_inj - loads.temperature_F, free))
+                d_t = t_inj - loads.temperature_F
+            d_force = service_force_lbf(md, free, c.p_internal_psi - p_ref, c.p_external_psi - p_ref, d_t, pipe)
         cases.append(LoadCase(c.name, c.mode, md, tvd, c.p_internal_psi, c.p_external_psi,
                               real0 + np.where(free, d_force, 0.0)))
     return StringLoads(geometry=g, md_ft=md, tvd_ft=tvd, temperature_F=loads.temperature_F,
@@ -552,11 +623,39 @@ def _with_axial(loads: StringLoads, settings: dict, pipe: PipeBody, mud, surface
                        notes=notes)
 
 
-def _avg(md: np.ndarray, y: ArrayLike, mask: np.ndarray) -> np.ndarray:
-    """MD-weighted average of y over the masked nodes (last axis), kept as (..., 1)."""
+def service_force_lbf(md: np.ndarray, free: np.ndarray, d_pi_psi, d_po_psi, d_t_F, pipe: NodePipe) -> np.ndarray:
+    """Axial force change in free pipe held at both ends (top and TOC), shaped (..., 1).
+
+    Each node would strain freely by eps = [207 As dT - 0.6 (dPi Ai - dPo Ao)] / (E As)
+    (thermal expansion and ballooning, Lubinski et al. 1962). Fixed ends keep
+    the total length, so dF = -integral(eps dL) / integral(dL / (E As)). For one
+    pipe size this is 0.6 avg(dPi Ai - dPo Ao) - 207 As avg(dT).
+    """
+    a_s = pipe.area_steel_in2
+    eps = (THERMAL_LBF_PER_IN2_PER_F * a_s * np.asarray(d_t_F)
+           - BALLOONING_2NU * (np.asarray(d_pi_psi) * pipe.area_inner_in2 - np.asarray(d_po_psi) * pipe.area_outer_in2)
+           ) / (STEEL_E_PSI * a_s)
+    return -_integral(md, eps, free) / _integral(md, 1.0 / (STEEL_E_PSI * a_s), free)
+
+
+def hanging_effective_tension_lbf(tvd_ft: np.ndarray, weight_lb_per_ft: np.ndarray, fluid_ppg) -> np.ndarray:
+    """Buoyed weight below each node for a string whose weight varies by node.
+
+    Each interval between nodes takes the weight of its upper node, so a
+    crossover's tiny gap interval belongs to the upper section. For one weight
+    this equals effective_tension_lbf.
+    """
+    tvd = np.asarray(tvd_ft, dtype=float)
+    seg = np.asarray(weight_lb_per_ft, dtype=float)[:-1] * np.diff(tvd)
+    below = np.concatenate([np.cumsum(seg[::-1])[::-1], [0.0]])
+    return buoyancy_factor(fluid_ppg) * below
+
+
+def _integral(md: np.ndarray, y, mask: np.ndarray) -> np.ndarray:
+    """Integral of y over MD across the masked nodes (last axis), kept as (..., 1)."""
     x = md[mask]
     v = np.broadcast_to(y, np.broadcast_shapes(np.shape(y), md.shape))[..., mask]
-    return np.trapezoid(v, x, axis=-1)[..., None] / (x[-1] - x[0])
+    return np.trapezoid(v, x, axis=-1)[..., None]
 
 
 def _default_fluid(g: StringGeometry, mud, completion):

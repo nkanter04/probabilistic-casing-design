@@ -1,0 +1,7 @@
+od_in,weight_lb_per_ft,grade,wall_in,drift_in,yield_psi,connection,conn_tension_lbf,conn_compression_lbf,conn_internal_psi,cost_per_ft,api_collapse_psi,api_burst_psi,source
+9.625,40.0,J55,0.395,,,,,,,,2570,3950,spec 6.1 table: published API ratings as listed in Tenaris data sheets
+9.625,40.0,L80,0.395,,,,,,,,3090,5750,spec 6.1 table: published API ratings as listed in Tenaris data sheets
+7.000,26.0,L80,0.362,,,,,,,,5410,7240,spec 6.1 table: published API ratings as listed in Tenaris data sheets
+7.000,29.0,L80,0.408,,,,,,,,7020,8160,spec 6.1 table: published API ratings as listed in Tenaris data sheets
+7.000,26.0,P110,0.362,,,,,,,,6230,9950,spec 6.1 table: published API ratings as listed in Tenaris data sheets
+4.500,11.6,P110,0.250,,,,,,,,7580,10690,spec 6.1 table: published API ratings as listed in Tenaris data sheets
