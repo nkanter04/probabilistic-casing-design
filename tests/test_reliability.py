@@ -157,13 +157,12 @@ def test_collect_variables_and_placeholders(well_c):
 def test_limit_states_at_base_equal_deterministic_margins(well_c):
     # The probabilistic g at base values must equal min(rating - load) from the deterministic code.
     w, p, geoms, pipes = well_c
-    pipe = pipes["intermediate"]
+    pipe = pipes["intermediate"].pipes[0]
     vs = collect_variables(w, geoms, "intermediate")
     ls = StringLimitStates(w, p, geoms, "intermediate", pipe, vs)
     sl = string_loads(w, p, geoms, "intermediate", PipeBody(pipe.od_in, pipe.id_in, pipe.weight_lb_per_ft))
-    ref_yield = pipe.yield_psi * vs.variables[1].base
-    dem = demands(sl, pipe, w.design_factors, ref_yield, pipe.od_in * vs.variables[2].base,
-                  pipe.wall_in * vs.variables[3].base)
+    dem = demands(sl, pipe, w.design_factors, 1.0, vs.variables[1].base, vs.variables[2].base,
+                  vs.variables[3].base)
     assert [(d.case, d.check) for d in dem] == ls.labels
     expect = [float(np.min(np.broadcast_to(d.rating - d.load, sl.md_ft.shape))) for d in dem]
     assert ls.base_g == pytest.approx(expect, rel=1e-12)

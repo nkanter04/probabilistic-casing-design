@@ -30,7 +30,7 @@ from typing import Callable
 import numpy as np
 from scipy import stats
 
-from .design import demands, setting_depths
+from .design import StringDesign, demands, setting_depths
 from .loads import (PipeBody, Realization, StringGeometry, required_mud_ppg, resolve_strings,
                     string_loads)
 from .profiles import Profiles, ProfileView, build_profiles
@@ -205,10 +205,10 @@ class StringLimitStates:
     """g(x) for every (case, check) of one string: x (n, k) -> g (n, n_states)."""
 
     def __init__(self, well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
-                 pipe: Pipe, variables: VariableSet, yield_derate: Callable | None = None):
+                 pipe: Pipe | StringDesign, variables: VariableSet, yield_derate: Callable | None = None):
         self.well, self.profiles, self.geometries, self.name = well, profiles, geometries, name
-        self.pipe, self.variables, self.yield_derate = pipe, variables, yield_derate
-        self.body = PipeBody(pipe.od_in, pipe.id_in, pipe.weight_lb_per_ft)
+        self.design, self.variables, self.yield_derate = StringDesign.of(pipe), variables, yield_derate
+        self.body = self.design.body()
         base = self(np.array([[v.base for v in variables.variables]]))  # also sets labels
         self.base_g = base[0]
 
@@ -218,10 +218,8 @@ class StringLimitStates:
         real = Realization({k: v for k, v in cols.items() if not k.startswith("pipe.")})
         sl = string_loads(self.well, self.profiles, self.geometries, self.name, self.body, real)
         factor = 1.0 if self.yield_derate is None else np.asarray(self.yield_derate(sl.temperature_F))
-        yp = self.pipe.yield_psi * cols.get("pipe.yield_ratio", 1.0) * factor
-        od = self.pipe.od_in * cols.get("pipe.od_ratio", 1.0)
-        wall = self.pipe.wall_in * cols.get("pipe.wall_ratio", 1.0)
-        dem = demands(sl, self.pipe, self.well.design_factors, yp, od, wall)
+        dem = demands(sl, self.design, self.well.design_factors, factor, cols.get("pipe.yield_ratio", 1.0),
+                      cols.get("pipe.od_ratio", 1.0), cols.get("pipe.wall_ratio", 1.0))
         self.labels = [(d.case, d.check) for d in dem]
         n, m = x.shape[0], len(sl.md_ft)
         return np.column_stack([np.min(np.broadcast_to(d.rating - d.load, (n, m)), axis=1) for d in dem])
@@ -260,7 +258,7 @@ def wilson_interval(failures, n: int, z: float = Z95) -> tuple[np.ndarray, np.nd
     denom = 1 + z * z / n
     center = (p + z * z / (2 * n)) / denom
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return np.maximum(center - half, 0.0), np.minimum(center + half, 1.0)
+    return np.where(f == 0, 0.0, np.maximum(center - half, 0.0)), np.minimum(center + half, 1.0)
 
 
 def monte_carlo(g: Callable[[np.ndarray], np.ndarray], variables: VariableSet, n: int = DEFAULT_SAMPLES,
@@ -407,17 +405,22 @@ class LimitStateResult:
     form: FORMResult | None
 
     @property
+    def has_mc(self) -> bool:
+        return not math.isnan(self.mc_pf)
+
+    @property
     def pf(self) -> float:
-        """Recommended Pf: Monte Carlo when its CoV meets the target, else FORM."""
-        if self.mc_cov <= TARGET_COV or self.form is None or not self.form.converged:
+        """Recommended Pf: Monte Carlo when its CoV meets the target, else FORM
+        (a non-converged FORM is used only when there is no Monte Carlo)."""
+        if self.form is None or (self.has_mc and (self.mc_cov <= TARGET_COV or not self.form.converged)):
             return self.mc_pf
         return self.form.pf
 
     @property
     def method(self) -> str:
-        if self.mc_cov <= TARGET_COV or self.form is None or not self.form.converged:
+        if self.form is None or (self.has_mc and (self.mc_cov <= TARGET_COV or not self.form.converged)):
             return "MC" if self.mc_pf > 0 else "MC (no failures)"
-        return "FORM"
+        return "FORM" if self.form.converged else "FORM (not converged)"
 
     @property
     def beta(self) -> float:
@@ -430,10 +433,10 @@ class LimitStateResult:
 @dataclass
 class StringReliability:
     string: str
-    pipe: Pipe
+    design: StringDesign
     variables: VariableSet
     rows: list[LimitStateResult]
-    mc: MCResult
+    mc: MCResult | None  # None when only FORM was run (optimizer screening)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -445,6 +448,10 @@ class StringReliability:
     def meets(self, target_pf: float) -> bool:
         return all(r.pf <= target_pf for r in self.rows)
 
+    @property
+    def governing(self) -> LimitStateResult:
+        return max(self.rows, key=lambda r: r.pf)
+
     def importance(self, case: str, check: str) -> dict[str, float]:
         """FORM importance factors alpha_i^2 (signed by alpha_i) for one limit state."""
         r = next(x for x in self.rows if x.case == case and x.check == check)
@@ -454,24 +461,34 @@ class StringReliability:
 
 
 def string_reliability(well: WellInput, profiles: Profiles, geometries: list[StringGeometry], name: str,
-                       pipe: Pipe, n: int = DEFAULT_SAMPLES, seed: int = 0, max_n: int = DEFAULT_MAX_SAMPLES,
-                       use_form: bool = True, yield_derate: Callable | None = None) -> StringReliability:
-    """Pf per load case and check for one string (Monte Carlo, plus FORM where useful)."""
+                       pipe: Pipe | StringDesign, n: int = DEFAULT_SAMPLES, seed: int = 0, max_n: int = DEFAULT_MAX_SAMPLES,
+                       use_form: bool = True, yield_derate: Callable | None = None,
+                       use_mc: bool = True) -> StringReliability:
+    """Pf per load case and check for one string (Monte Carlo, plus FORM where
+    useful). With use_mc=False only FORM runs, on every limit state (fast
+    screening for the optimizer)."""
     variables = collect_variables(well, geometries, name)
     ls = StringLimitStates(well, profiles, geometries, name, pipe, variables, yield_derate)
-    mc = monte_carlo(ls, variables, n=n, seed=seed, max_n=max_n)
-    lo, hi = mc.ci()
-    need_form = [j for j in range(len(ls.labels)) if use_form and mc.cov[j] > TARGET_COV]
+    n_states = len(ls.labels)
+    if use_mc:
+        mc = monte_carlo(ls, variables, n=n, seed=seed, max_n=max_n)
+        lo, hi = mc.ci()
+        pf, cov = mc.pf, mc.cov
+    else:
+        mc = None
+        lo = hi = pf = np.full(n_states, np.nan)
+        cov = np.full(n_states, np.inf)
+    need_form = [j for j in range(n_states) if use_form and cov[j] > TARGET_COV]
     forms = form_many(ls, variables, need_form) if need_form else {}
-    rows = [LimitStateResult(case, check, float(ls.base_g[j]), float(mc.pf[j]), (float(lo[j]), float(hi[j])),
-                             float(mc.cov[j]), forms.get(j))
+    rows = [LimitStateResult(case, check, float(ls.base_g[j]), float(pf[j]), (float(lo[j]), float(hi[j])),
+                             float(cov[j]), forms.get(j))
             for j, (case, check) in enumerate(ls.labels)]
     notes = list(variables.notes)
     if yield_derate is None:
         notes.append(f"{name}: no temperature derating of yield (manufacturer table not supplied)")
     notes.append(f"{name}: API TR 5C3 (serviceability) resistance model; the ISO/TR 10400 ultimate-limit-state "
                  "model is not built yet, so Pf is conservative and uneven across D/t (Ju et al. 1998)")
-    return StringReliability(name, pipe, variables, rows, mc, notes)
+    return StringReliability(name, ls.design, variables, rows, mc, notes)
 
 
 @dataclass
@@ -532,3 +549,11 @@ def target_sweep(results: dict[str, StringReliability],
                  targets: tuple[float, ...] = SWEEP_TARGETS) -> dict[float, dict[str, bool]]:
     """Whether each string meets each reliability target (spec 4.3 sweep)."""
     return {t: {name: r.meets(t) for name, r in results.items()} for t in targets}
+
+
+def reliability_for_check(check, n: int = DEFAULT_SAMPLES, seed: int = 0,
+                          max_n: int = DEFAULT_MAX_SAMPLES) -> dict[str, StringReliability]:
+    """Pf for every string that a deterministic WellCheck checked, with the same designs."""
+    return {name: string_reliability(check.well, check.profiles, check.geometries, name, c.design, n=n, seed=seed,
+                                     max_n=max_n)
+            for name, c in check.checks.items()}
