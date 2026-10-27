@@ -7,7 +7,7 @@
 
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, the deterministic report, probability of failure by Monte Carlo and FORM, and least-cost string selection from a pipe catalog (single and tapered strings).
+> **Status:** early development. Done: pipe-body ratings, input schema with unit handling, the synthetic-well generator with three bundled test wells in [examples/](examples/), the minimum-curvature trajectory, the depth profiles (pore pressure, Eaton fracture gradient, overburden, temperature), the burst, collapse and axial load cases, setting depths with kick tolerance, the deterministic design-factor check, the deterministic report, probability of failure by Monte Carlo and FORM, least-cost string selection from a pipe catalog (single and tapered strings), and sensitivity outputs (tornado, Sobol indices, Pf vs treating pressure).
 
 ## Usage
 
@@ -15,7 +15,7 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 casingrel run examples/synthetic_c_horizontal_frac.yaml -o reports/well_c
 ```
 
-This writes `report.md` (summary, setting depths and kick tolerance, design-factor tables, assumptions list), `plots/` and `design_factors.csv`. Add `--probabilistic` for probability of failure.
+This writes `report.md` (summary, setting depths and kick tolerance, design-factor tables, assumptions list), `plots/` and `design_factors.csv`. Add `--probabilistic` for probability of failure and sensitivity charts.
 
 ```bash
 casingrel optimize examples/synthetic_c_horizontal_frac.yaml -o reports/well_c_opt

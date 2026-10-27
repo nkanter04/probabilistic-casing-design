@@ -24,6 +24,7 @@ from .optimize import optimize_well
 from .reliability import DEFAULT_MAX_SAMPLES, DEFAULT_SAMPLES, reliability_for_check, shoe_move_probability
 from .report import DISCLAIMER, write_report
 from .schema import load_well
+from .sensitivity import string_sensitivity
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--max-samples", type=int, default=DEFAULT_MAX_SAMPLES,
                        help="Monte Carlo cap while adding samples to reach a 10%% CoV")
         p.add_argument("--seed", type=int, default=0, help="random seed")
+        p.add_argument("--no-sensitivity", action="store_true",
+                       help="skip the tornado, Sobol and treating-pressure outputs")
     run.add_argument("--design", default=None, help="reference design to check (default: the first one)")
     run.add_argument("--probabilistic", action="store_true", help="also compute probability of failure")
     opt.add_argument("--target", type=float, default=None, help="Pf target (default: the input's)")
@@ -72,20 +75,28 @@ def main(argv: list[str] | None = None) -> int:
             if args.probabilistic:
                 rel = reliability_for_check(result, n=args.samples, seed=args.seed, max_n=args.max_samples)
                 moves = shoe_move_probability(well, result.profiles, seed=args.seed)
-            path = write_report(result, out, rel, moves)
+            sens = None if rel is None or args.no_sensitivity else _sensitivity(result, rel, args.seed)
+            path = write_report(result, out, rel, moves, sensitivity=sens)
         else:
             o = optimize_well(well, args.input, args.catalog, args.target, not args.no_deterministic_check,
                               args.samples, args.seed, not args.no_taper, args.max_samples)
             result = check_well(well, profiles=o.profiles, designs=o.designs, design_name="optimized")
             rel = {k: s.chosen.reliability for k, s in o.strings.items() if s.chosen is not None}
             moves = shoe_move_probability(well, o.profiles, seed=args.seed)
-            path = write_report(result, out, rel, moves, o)
+            sens = None if args.no_sensitivity else _sensitivity(result, rel, args.seed)
+            path = write_report(result, out, rel, moves, o, sens)
     except (ValueError, FileNotFoundError) as exc:
         print(f"Cannot run {args.input}: {exc}", file=sys.stderr)
         return 2
     print(_console_summary(result, rel))
     print(f"Report written to {path}")
     return 0
+
+
+def _sensitivity(result, rel, seed: int):
+    return {name: string_sensitivity(result.well, result.profiles, result.geometries, name,
+                                     result.checks[name].design, rel[name], seed=seed)
+            for name in rel if name in result.checks}
 
 
 def _console_summary(result, rel=None) -> str:
